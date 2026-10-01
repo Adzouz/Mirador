@@ -1,0 +1,105 @@
+name: Release
+
+# Push a tag like v0.2.0 → universal DMG + GitHub release with generated notes.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Select the newest Xcode on the runner
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          swift --version
+
+      - name: Test
+        run: swift test
+
+      - name: Set version from tag
+        run: echo "${TAG#v}" > VERSION
+
+      - name: Build DMG
+        env:
+          # Optional: set these repository secrets to ship a signed + notarized build.
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
+        run: |
+          if [[ -n "$CERTIFICATE_P12" ]]; then
+            KEYCHAIN="$RUNNER_TEMP/build.keychain"
+            security create-keychain -p ci "$KEYCHAIN"
+            security set-keychain-settings "$KEYCHAIN"
+            security unlock-keychain -p ci "$KEYCHAIN"
+            echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
+            security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          fi
+          ./scripts/make-dmg.sh
+
+      - name: Publish release
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          VERSION="$(cat VERSION)"
+          DMG="dist/Mirador-$VERSION.dmg"
+          shasum -a 256 "$DMG" | sed 's#dist/##' > "$DMG.sha256"
+          if [[ -n "${{ secrets.MACOS_SIGN_IDENTITY }}" ]]; then
+            OPEN_NOTE="Signed and notarized: open it like any app."
+          else
+            OPEN_NOTE="Not notarized yet: the first time, **right-click Mirador → Open** (or System Settings → Privacy & Security → Open Anyway)."
+          fi
+          cat > notes.md <<NOTES
+          ## Install
+
+          1. Download **Mirador-$VERSION.dmg** below and drag Mirador to Applications.
+          2. $OPEN_NOTE
+          3. Follow the setup checklist (GitHub, Linear, folders, command-line tool, Claude Code skill).
+
+          Already installed? Mirador updates itself (Mirador → Check for Updates…).
+
+          Requires macOS 14+ and the GitHub CLI (\`gh auth login\`). Universal: Apple silicon and Intel.
+
+          NOTES
+          ASSETS=("$DMG" "$DMG.sha256")
+          # Auto-update feed (Sparkle): installed apps read releases/latest/download/appcast.xml.
+          if [[ -n "$SPARKLE_PRIVATE_KEY" ]]; then
+            ./scripts/make-appcast.sh "$DMG" \
+              "https://github.com/${{ github.repository }}/releases/download/$TAG/Mirador-$VERSION.dmg" \
+              "https://github.com/${{ github.repository }}/releases/tag/$TAG"
+            ASSETS+=(dist/appcast.xml)
+          else
+            echo "::warning::SPARKLE_PRIVATE_KEY is not set: no appcast.xml, installed apps will not see this update."
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            # The REST API prepends `body` to the generated "What's Changed" notes.
+            gh api "repos/${{ github.repository }}/releases" \
+              -f tag_name="$TAG" -f name="Mirador $TAG" -F generate_release_notes=true -F body=@notes.md
+            gh release upload "$TAG" "${ASSETS[@]}"
+          fi

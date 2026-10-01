@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+*.xcodeproj
+dist/
+.DS_Store
+
+# Secrets: never commit signing material
+sparkle-private-key*
+*.p12
+*.key
+*.pem
+*.cer
+*.mobileprovision
