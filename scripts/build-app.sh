@@ -4,6 +4,7 @@
 # Optional environment:
 #   SIGN_IDENTITY      "Developer ID Application: …" certificate in the keychain → distributable, hardened build
 #   SPARKLE_FEED_URL   appcast for auto-updates; defaults to <origin repo>/releases/latest/download/appcast.xml
+#   MIRADOR_NO_UPDATES=1  no feed at all (local development builds must not replace themselves with a release)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -18,7 +19,9 @@ else
 fi
 
 # Auto-update feed: GitHub "latest release" asset of the origin repository.
-if [[ -z "${SPARKLE_FEED_URL:-}" ]]; then
+if [[ -n "${MIRADOR_NO_UPDATES:-}" ]]; then
+  SPARKLE_FEED_URL=""
+elif [[ -z "${SPARKLE_FEED_URL:-}" ]]; then
   ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
   SLUG="$(echo "$ORIGIN" | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')"
   [[ "$ORIGIN" == *github.com* && -n "$SLUG" ]] && SPARKLE_FEED_URL="https://github.com/$SLUG/releases/latest/download/appcast.xml"

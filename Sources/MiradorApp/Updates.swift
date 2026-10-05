@@ -62,7 +62,7 @@ struct UpdatesCard: View {
                     .onChange(of: automatic) { _, value in updates.automaticallyChecks = value }
                 Muted(updates.lastCheck.map { "Last checked \($0.formatted(.relative(presentation: .named)))." } ?? "Not checked yet.", size: 11)
             } else {
-                Muted("This build has no update feed (built locally without a GitHub origin). Release builds update themselves.", size: 11)
+                Muted("Local development build: auto-updates are off so a release never replaces your changes. Builds from the Releases page update themselves.", size: 11)
             }
         }
     }

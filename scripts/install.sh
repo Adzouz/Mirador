@@ -5,7 +5,8 @@ cd "$(dirname "$0")/.."
 
 osascript -e 'quit app "Mirador"' 2>/dev/null || true
 mkdir -p .build/app "$HOME/Applications" "$HOME/.local/bin"
-BUILT="$(./scripts/build-app.sh .build/app)"
+# Local development build: no auto-update feed, so a published release never replaces your local changes.
+BUILT="$(MIRADOR_NO_UPDATES=1 ./scripts/build-app.sh .build/app)"
 APP="$HOME/Applications/Mirador.app"
 rm -rf "$APP"
 cp -R "$BUILT" "$APP"
