@@ -785,3 +785,43 @@ private func openPR(_ number: Int, branch: String, author: String = "me") throws
     let decoded = try JSONDecoder().decode(StoreData.self, from: JSONSerialization.data(withJSONObject: json))
     #expect(decoded.tasks[0].issueNumber == nil)
 }
+
+@Test func batchKeepsAliasesWhenOneFails() {
+    // What `gh api graphql` prints (with a non-zero exit) when one number in the batch is not an issue.
+    let stdout = #"{"data":{"repository":{"i1":{"number":1,"title":"a","state":"OPEN"},"i2":null}},"errors":[{"message":"Could not resolve to an Issue with the number of 2."}]}"#
+    let issues = GitHubSync.batch(stdout, as: GitHubSync.Issue.self)
+    #expect(issues.map(\.number) == [1])
+    #expect(GitHubSync.batch("gh: error", as: GitHubSync.Issue.self).isEmpty)
+}
+
+@Test func detachedHeadTakesOnlyThePRItIsTheHeadOf() {
+    let squashed = Cleanup.CommitPR(number: 5, state: "MERGED", mergedAt: nil, closedAt: nil, headRefOid: "fff")
+    // A develop commit: associated with the merged PR that brought it, but not that PR's head.
+    #expect(Cleanup.pullRequest(at: "abc", among: [squashed]) == nil)
+    let checkedOut = Cleanup.CommitPR(number: 6, state: "OPEN", mergedAt: nil, closedAt: nil, headRefOid: "ABC")
+    #expect(Cleanup.pullRequest(at: "abc", among: [squashed, checkedOut])?.number == 6)
+}
+
+@Test func monorepoIsRecognisedThroughASymlink() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    let real = dir.appendingPathComponent("strapi")
+    let link = dir.appendingPathComponent("link")
+    try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    #expect(Worktrees.samePath(link.path, real.path))
+    var settings = AppSettings()
+    settings.repoPath = link.path
+    #expect(settings.isMonorepo(real.path))
+    #expect(!settings.isMonorepo(dir.path))
+}
+
+@Test func linearOptionAcceptsOnlyTicketKeys() {
+    #expect(TaskLink.parseLinear("cms-12") == .linear("CMS-12"))
+    #expect(TaskLink.parseLinear("https://linear.app/strapi/issue/CMS-9/x") == .linear("CMS-9"))
+    #expect(TaskLink.parseLinear("ENG-4") == .linear("ENG-4"))
+    #expect(TaskLink.parseLinear("foo") == nil)
+    #expect(TaskLink.parseLinear("123") == nil)
+    #expect(TaskLink.parseLinear("CMS-1\" }") == .linear("CMS-1"))
+    #expect(TaskLink.parseLinear("AB\"-1") == nil)
+}

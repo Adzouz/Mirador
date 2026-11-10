@@ -116,7 +116,7 @@ struct AddTaskSheet: View {
         let link = preview.taskLink
         if target.has(link) { return "Already linked to this task." }
         var notes: [String] = []
-        if let other = model.tasks.first(where: { $0.id != target.id && $0.has(link) }) {
+        if let other = model.tasks.owner(of: link, excluding: target.id) {
             notes.append("Already tracked as “\(other.title)”. Linking merges it into this task.")
         }
         if let old = target.links.first(where: { $0.sameType(as: link) }) {

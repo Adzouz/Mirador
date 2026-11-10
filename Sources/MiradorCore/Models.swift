@@ -459,7 +459,7 @@ public struct AppSettings: Codable, Hashable, Sendable {
     }
 
     public func isMonorepo(_ path: String) -> Bool {
-        (path as NSString).standardizingPath == (repoPath as NSString).standardizingPath
+        Worktrees.samePath(path, repoPath)
     }
 
     public func port(for path: String) -> Int { isMonorepo(path) ? monorepoPort : worktreePort }

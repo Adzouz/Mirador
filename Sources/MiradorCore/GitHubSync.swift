@@ -211,9 +211,18 @@ public enum GitHubSync {
         return snap
     }
 
+    /// Values of an aliased GraphQL batch. `gh` exits non-zero when one alias fails (a number that is not a PR, or not
+    /// an issue), yet still prints the others: keep them instead of dropping the whole batch.
+    static func batch<T: Decodable>(_ stdout: String, as: T.Type, decoder: JSONDecoder = JSONDecoder()) -> [T] {
+        guard let env = try? decoder.decode(GraphQLEnvelope<RepositoryBatch<T>>.self, from: Data(stdout.utf8)),
+              let repo = env.data?.repository else { return [] }
+        return repo.values.compactMap { $0 }
+    }
+
+    struct RepositoryBatch<T: Decodable>: Decodable { var repository: [String: T?]? }
+
     /// PRs by number, 20 per request. A failed batch just leaves those tasks as they were.
     static func pullRequests(_ numbers: [Int]) -> [PullRequest] {
-        struct Body: Decodable { var repository: [String: PullRequest?] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         var out: [PullRequest] = []
@@ -221,11 +230,7 @@ public enum GitHubSync {
         for start in stride(from: 0, to: sorted.count, by: 20) {
             let fields = sorted[start..<min(start + 20, sorted.count)].map { "p\($0): pullRequest(number: \($0)) { \(prFields) }" }
             let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields.joined(separator: "\n")) } }"
-            let r = Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"])
-            guard r.status == 0,
-                  let env = try? decoder.decode(GraphQLEnvelope<Body>.self, from: Data(r.stdout.utf8)),
-                  let repo = env.data?.repository else { continue }
-            out += repo.values.compactMap { $0 }
+            out += batch(Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"]).stdout, as: PullRequest.self, decoder: decoder)
         }
         return out
     }
@@ -239,17 +244,12 @@ public enum GitHubSync {
 
     /// Issues by number, 20 per request. A failed batch just leaves those tasks as they were.
     static func issues(_ numbers: [Int]) -> [Issue] {
-        struct Body: Decodable { var repository: [String: Issue?] }
         var out: [Issue] = []
         let sorted = Array(Set(numbers)).sorted()
         for start in stride(from: 0, to: sorted.count, by: 20) {
             let fields = sorted[start..<min(start + 20, sorted.count)].map { "i\($0): issue(number: \($0)) { number title state }" }
             let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields.joined(separator: "\n")) } }"
-            let r = Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"])
-            guard r.status == 0,
-                  let env = try? JSONDecoder().decode(GraphQLEnvelope<Body>.self, from: Data(r.stdout.utf8)),
-                  let repo = env.data?.repository else { continue }
-            out += repo.values.compactMap { $0 }
+            out += batch(Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"]).stdout, as: Issue.self)
         }
         return out
     }

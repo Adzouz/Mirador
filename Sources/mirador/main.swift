@@ -115,8 +115,7 @@ case "start":
         }
         apply(options: args.options, to: &t)
         t.branch = t.branch ?? branch
-        let repo = (data.settings.repoPath as NSString).resolvingSymlinksInPath
-        if let top, (top as NSString).resolvingSymlinksInPath != repo { t.worktreePath = t.worktreePath ?? top }
+        if let top, !Worktrees.samePath(top, data.settings.repoPath) { t.worktreePath = t.worktreePath ?? top }
         t.linearKey = t.linearKey ?? LinearKey.find(in: branch)
         t.archived = false
         t.noteStart(.now)

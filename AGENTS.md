@@ -91,4 +91,8 @@ swift test                  # must stay green; add a test for every rule you add
   uses `gh pr checkout --detach` (PRs) or explains how to free the branch.
 - The GitHub searches drop a PR once it is closed or the review request is gone, so its task never learned it merged.
   `fetch(tracking:)` looks up open tasks' PRs the searches missed by number and applies only their end state.
-- macOS paths can differ by symlink (`/var` vs `/private/var`): compare resolved paths.
+- macOS paths can differ by symlink (`/var` vs `/private/var`): compare resolved paths (`Worktrees.samePath`).
+- `gh api graphql` exits non-zero when one alias of a batch fails (a number that is not a PR / issue) but still prints
+  the others: decode stdout anyway (`GitHubSync.batch`), never gate on the exit status.
+- Every commit on develop is "associated" with the merged PR that brought it. A detached worktree belongs to a PR only
+  when HEAD is that PR's `headRefOid` (`Cleanup.pullRequest(at:among:)`).

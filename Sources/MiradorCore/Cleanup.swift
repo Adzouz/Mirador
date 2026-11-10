@@ -212,6 +212,15 @@ public enum Cleanup {
 
     struct PRState { var number: Int; var state: String; var endedAt: Date? }
 
+    struct CommitPR: Decodable { var number: Int; var state: String; var mergedAt: Date?; var closedAt: Date?; var headRefOid: String? }
+
+    /// The PR a detached HEAD was checked out from: one whose head commit is HEAD. Any commit already on develop is
+    /// also "associated" with the merged PR that brought it there, which says nothing about this worktree.
+    static func pullRequest(at sha: String, among nodes: [CommitPR]) -> PRState? {
+        guard let node = nodes.first(where: { $0.headRefOid?.lowercased() == sha.lowercased() }) else { return nil }
+        return PRState(number: node.number, state: node.state, endedAt: node.mergedAt ?? node.closedAt)
+    }
+
     static func pullRequestStates(forNumbers numbers: [Int]) -> [Int: PRState] {
         struct Node: Decodable { var number: Int; var state: String; var mergedAt: Date?; var closedAt: Date? }
         struct Body: Decodable { var repository: [String: Node?] }
@@ -237,8 +246,7 @@ public enum Cleanup {
 
     /// Latest PR containing each commit (detached worktrees), 40 commits per GraphQL request.
     static func pullRequestStates(forCommits shas: [String]) -> [String: PRState] {
-        struct Node: Decodable { var number: Int; var state: String; var mergedAt: Date?; var closedAt: Date? }
-        struct Conn: Decodable { var nodes: [Node] }
+        struct Conn: Decodable { var nodes: [CommitPR] }
         struct Commit: Decodable { var associatedPullRequests: Conn? }
         struct Body: Decodable { var repository: [String: Commit?] }
         var out: [String: PRState] = [:]
@@ -248,16 +256,14 @@ public enum Cleanup {
         for start in stride(from: 0, to: unique.count, by: 40) {
             let chunk = Array(unique[start..<min(start + 40, unique.count)])
             let fields = chunk.enumerated().map { i, sha in
-                "c\(i): object(oid: \"\(sha)\") { ... on Commit { associatedPullRequests(first: 1, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number state mergedAt closedAt } } } }"
+                "c\(i): object(oid: \"\(sha)\") { ... on Commit { associatedPullRequests(first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number state mergedAt closedAt headRefOid } } } }"
             }.joined(separator: "\n")
             let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields) } }"
             let r = Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"])
             guard let env = try? decoder.decode(GraphQLEnvelope<Body>.self, from: Data(r.stdout.utf8)),
                   let repo = env.data?.repository else { continue }
             for (i, sha) in chunk.enumerated() {
-                if let node = repo["c\(i)"]??.associatedPullRequests?.nodes.first {
-                    out[sha] = PRState(number: node.number, state: node.state, endedAt: node.mergedAt ?? node.closedAt)
-                }
+                if let pr = pullRequest(at: sha, among: repo["c\(i)"]??.associatedPullRequests?.nodes ?? []) { out[sha] = pr }
             }
         }
         return out

@@ -39,9 +39,10 @@ private struct FocusBar: View {
             .shadButton(.outline)
             .help("Put it on the skipped stack and move to the next task. It stays there, out of the way, until you pick it again.")
             SkippedButton()
+            // No bare Esc here: the task's notes, menus and popovers below use it to cancel.
             Button { model.focusMode = false } label: { Label("Exit focus", systemImage: "xmark") }
                 .shadButton(.ghost)
-                .keyboardShortcut(.escape, modifiers: [])
+                .help("Exit focus (⇧⌘F)")
         }
         .foregroundStyle(Theme.foreground)
         .padding(.horizontal, 24)

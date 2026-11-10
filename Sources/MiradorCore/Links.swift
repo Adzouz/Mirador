@@ -26,9 +26,12 @@ public enum TaskLink: Hashable, Sendable {
     /// From `--pr 123`, `--issue 45`, `--linear CMS-1` style input.
     public static func parsePR(_ raw: String) -> TaskLink? { number(raw).map(TaskLink.pr) }
     public static func parseIssue(_ raw: String) -> TaskLink? { number(raw).map(TaskLink.issue) }
+    /// A key of a configured team (`CMS-123`), or any `ABC-123` shaped key. Anything else is refused.
     public static func parseLinear(_ raw: String) -> TaskLink? {
-        let key = LinearKey.find(in: raw) ?? raw.trimmingCharacters(in: .whitespaces).uppercased()
-        return key.isEmpty ? nil : .linear(key)
+        let text = raw.trimmingCharacters(in: .whitespaces)
+        if let key = LinearKey.find(in: text) { return .linear(key) }
+        guard text.range(of: #"^[A-Za-z][A-Za-z0-9]{0,9}-\d+$"#, options: .regularExpression) != nil else { return nil }
+        return .linear(text.uppercased())
     }
 
     private static func number(_ raw: String) -> Int? {
@@ -168,10 +171,16 @@ public extension TaskLink {
     }
 }
 
-public extension StoreData {
-    /// The task, other than `id`, that already holds this link.
+public extension Array where Element == TrackedTask {
+    /// The task, other than `id`, that already holds this link: the one `StoreData.link` merges.
     func owner(of link: TaskLink, excluding id: TrackedTask.ID? = nil) -> TrackedTask? {
-        tasks.first { $0.id != id && $0.has(link) }
+        first { $0.id != id && $0.has(link) }
+    }
+}
+
+public extension StoreData {
+    func owner(of link: TaskLink, excluding id: TrackedTask.ID? = nil) -> TrackedTask? {
+        tasks.owner(of: link, excluding: id)
     }
 
     /// Links the task. When another task already holds the link, that task is merged into this one and removed,

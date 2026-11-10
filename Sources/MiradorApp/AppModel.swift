@@ -321,6 +321,9 @@ final class AppModel {
         linearKeyLoaded = true
         linearConnection = .checking
         linearError = nil
+        // With no key, syncLinear returns at once: clear the old Linear state here, not after a sync.
+        if key == nil { linearUser = nil }
+        updateErrorMessage()
         store.update { $0.linearAuthFailed = nil }
         reload()
         if key != nil { syncLinear() }
@@ -577,6 +580,10 @@ final class AppModel {
     var runningPaths: [String] { running.map(\.worktreePath) }
     /// Last Cleanup scan, shown at once when the tab is opened again.
     var cleanupReport: Cleanup.Report?
+    /// Kept here, not in the view, so a scan started before the tab was left is still the one that counts.
+    var cleanupGeneration = 0
+    /// Fetch + GitHub pass in flight.
+    var cleanupSyncingRemote = false
 
     /// The environment running in the same slot (monorepo / worktree) as `path`, if it is a different one.
     func slotConflict(for path: String) -> RunningEnvironment? {

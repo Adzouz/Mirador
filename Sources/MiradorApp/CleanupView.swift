@@ -11,8 +11,10 @@ struct CleanupView: View {
     }
     @State private var scanning = false
     /// The local list is shown; fetch + GitHub PR states are still coming.
-    @State private var syncingRemote = false
-    @State private var scanGeneration = 0
+    private var syncingRemote: Bool {
+        get { model.cleanupSyncingRemote }
+        nonmutating set { model.cleanupSyncingRemote = newValue }
+    }
     @State private var working = false
     @State private var branchFilter: Cleanup.BranchState? = nil
     @State private var selectedBranches: Set<String> = []
@@ -62,7 +64,8 @@ struct CleanupView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Theme.background)
-        .onAppear { scan() }
+        // Back on the tab while a scan is still syncing: let that one finish instead of starting a second fetch.
+        .onAppear { if !syncingRemote { scan() } }
         .confirmationDialog(branchDialogTitle, isPresented: $confirmBranches, titleVisibility: .visible) {
             Button("Delete \(selectedBranches.count) branch\(selectedBranches.count == 1 ? "" : "es")", role: .destructive, action: deleteBranches)
             Button("Cancel", role: .cancel) {}
@@ -192,23 +195,25 @@ struct CleanupView: View {
     /// Local pass first (instant list, last known PR states), then fetch + GitHub. A newer scan drops older results.
     private func scan(keepSkipped: Bool) {
         scanning = true
-        scanGeneration += 1
-        let generation = scanGeneration
+        model.cleanupGeneration += 1
+        let generation = model.cleanupGeneration
+        let model = model
         let settings = model.settings
         let running = model.runningPaths
         Task.detached {
             let local = Cleanup.scanLocal(settings: settings, running: running)
             await MainActor.run {
-                guard generation == scanGeneration else { return }
+                guard generation == model.cleanupGeneration else { return }
                 show(local.carryingRemoteState(from: report), keepSkipped: keepSkipped)
                 scanning = false
                 syncingRemote = true
             }
             let full = Cleanup.scan(settings: settings, running: running)
             await MainActor.run {
-                guard generation == scanGeneration else { return }
+                guard generation == model.cleanupGeneration else { return }
+                model.cleanupReport = full
+                model.cleanupSyncingRemote = false
                 show(full, keepSkipped: keepSkipped)
-                syncingRemote = false
             }
         }
     }
