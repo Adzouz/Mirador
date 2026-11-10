@@ -4,6 +4,7 @@ import MiradorCore
 /// Menu bar panel: fixed header (environment), scrollable middle (pings, needs me), fixed footer.
 struct MenuBarView: View {
     @Environment(AppModel.self) private var model
+    @State private var panelHeight: CGFloat = 0
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
@@ -13,8 +14,12 @@ struct MenuBarView: View {
             Divider().overlay(Theme.border)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if !model.unreadPings.isEmpty { pingsSection }
-                    needsMeSection
+                    if model.focusMode {
+                        MenuFocusCard()
+                    } else {
+                        if !model.unreadPings.isEmpty { pingsSection }
+                        needsMeSection
+                    }
                 }
                 .padding(12)
             }
@@ -25,9 +30,16 @@ struct MenuBarView: View {
         }
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Theme.background.ignoresSafeArea())
-        // The menu bar window keeps its first height; resize it to the panel so nothing shows above or below.
-        .background(WindowFitter())
+        .background(Theme.background)
+        // The menu bar window keeps its first height and centers the panel in it; measure the panel and give the
+        // window exactly that height.
+        .background(GeometryReader { proxy in
+            Color.clear
+                .onAppear { panelHeight = proxy.size.height }
+                .onChange(of: proxy.size.height) { _, height in panelHeight = height }
+        })
+        .background(WindowFitter(height: panelHeight))
+        .frame(maxHeight: .infinity, alignment: .top)
         .ignoresSafeArea()
     }
 
@@ -143,17 +155,15 @@ struct SectionTitle<Trailing: View>: View {
 }
 
 /// The environment block at the top: every running environment, then pick + quickstart for another one.
+/// The environment block at the top: the monorepo slot, then the worktree slot, each startable on its own.
 struct MenuEnvironmentCard: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("quickstartPath") private var quickstartPath = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(model.running, id: \.worktreePath) { env in
-                RunningEnvironmentBlock(path: env.worktreePath)
-                Divider().overlay(Theme.border)
-            }
-            quickstart
+            monorepoSlot
+            Divider().overlay(Theme.border)
+            worktreeSlot
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -162,25 +172,36 @@ struct MenuEnvironmentCard: View {
     }
 
     @ViewBuilder
-    private var quickstart: some View {
-        let running = Set(model.runningPaths)
-        let options = model.startableWorktrees.filter { !running.contains($0.path) }
-        if options.isEmpty {
-            Muted("No other checkout to start.", size: 11)
+    private var monorepoSlot: some View {
+        if let repo = model.monorepo {
+            if model.state(of: repo.path) == .stopped {
+                EnvironmentQuickRow(path: repo.path, title: "Monorepo", subtitle: repo.branch ?? "detached")
+            } else {
+                RunningEnvironmentBlock(path: repo.path)
+            }
         } else {
-            let selected = options.first { $0.path == quickstartPath } ?? options[0]
+            Muted("Monorepo not found — set its folder in Settings.", size: 11)
+        }
+    }
+
+    @ViewBuilder
+    private var worktreeSlot: some View {
+        if let running = model.running.first(where: { !model.isMonorepo($0.worktreePath) }) {
+            RunningEnvironmentBlock(path: running.worktreePath)
+        }
+        let choices = model.worktreeChoices.filter { !model.runningPaths.contains($0.path) }
+        if choices.isEmpty {
+            if model.running.allSatisfy({ model.isMonorepo($0.worktreePath) }) {
+                Muted("No worktree yet — create one from a task.", size: 11)
+            }
+        } else {
+            let selected = choices.first { $0.path == model.lastWorktreePath } ?? choices[0]
             VStack(alignment: .leading, spacing: 6) {
-                if model.running.isEmpty {
-                    HStack {
-                        EnvironmentBadge(state: model.busyEnvironment == nil ? .stopped : .starting)
-                        Muted("monorepo :\(String(model.settings.monorepoPort)) · worktree :\(String(model.settings.worktreePort))", size: 11)
-                    }
-                }
                 HStack(spacing: 6) {
                     Menu {
-                        ForEach(options) { wt in
+                        ForEach(choices) { wt in
                             Button {
-                                quickstartPath = wt.path
+                                model.lastWorktreePath = wt.path
                             } label: {
                                 Text(model.environmentTitle(for: wt.path))
                                 Text("\(wt.name) · :\(String(model.port(for: wt.path)))")
@@ -198,7 +219,6 @@ struct MenuEnvironmentCard: View {
                     .buttonStyle(ShadButtonStyle(variant: .outline, size: .md))
                     .menuIndicator(.visible)
                     Button {
-                        quickstartPath = selected.path
                         model.startEnvironment(selected.path)
                     } label: {
                         Label("Quickstart", systemImage: "play.fill")
@@ -208,8 +228,6 @@ struct MenuEnvironmentCard: View {
                 }
                 if let other = model.slotConflict(for: selected.path) {
                     Muted("Stops \((other.worktreePath as NSString).lastPathComponent) (same :\(String(model.port(for: selected.path))) slot).", size: 11)
-                } else if !model.running.isEmpty {
-                    Muted("Runs next to the environment above.", size: 11)
                 }
             }
         }
@@ -314,12 +332,20 @@ struct PingRow: View {
                         Text(ping.headline).font(.caption.weight(.semibold))
                         Text(ping.title).font(.caption).lineLimit(2).foregroundStyle(.secondary)
                     }
+                    .opacity(ping.read ? 0.6 : 1)
                     Spacer()
                     Text(ping.at.formatted(.relative(presentation: .numeric, unitsStyle: .narrow))).font(.caption2).foregroundStyle(.tertiary).fixedSize()
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            Button { model.markRead(ping.id) } label: {
+                Image(systemName: "checkmark").font(.system(size: 9, weight: .bold))
+            }
+            .buttonStyle(ShadButtonStyle(variant: .ghost, size: .icon))
+            .opacity(ping.read ? 0 : hovering ? 1 : 0.35)
+            .disabled(ping.read)
+            .help("Mark as read")
             Button { withAnimation(.easeOut(duration: 0.15)) { model.deletePing(ping.id) } } label: {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
             }
@@ -345,19 +371,32 @@ extension Ping {
     }
 }
 
-/// Keeps the hosting window exactly as tall as the SwiftUI content, anchored to its top edge (under the menu bar).
+/// Gives the hosting window the panel's measured height, anchored to its top edge (under the menu bar), now and every
+/// time the menu bar window is shown again.
 struct WindowFitter: NSViewRepresentable {
+    let height: CGFloat
+
     func makeNSView(context: Context) -> FitterView { FitterView() }
-    func updateNSView(_ view: FitterView, context: Context) { view.fitSoon() }
+
+    func updateNSView(_ view: FitterView, context: Context) {
+        view.target = height
+        view.fitSoon()
+    }
 
     final class FitterView: NSView {
+        var target: CGFloat = 0
+        private var observers: [NSObjectProtocol] = []
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            fitSoon()
-        }
-
-        override func layout() {
-            super.layout()
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            guard let window else { return }
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResizeNotification] {
+                observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    self?.fitSoon()
+                })
+            }
             fitSoon()
         }
 
@@ -366,11 +405,9 @@ struct WindowFitter: NSViewRepresentable {
         }
 
         private func fit() {
-            guard let window, let content = window.contentView else { return }
-            let target = content.fittingSize.height
-            guard target > 50 else { return }
+            guard let window, target > 50 else { return }
             let current = window.contentRect(forFrameRect: window.frame).height
-            guard abs(current - target) > 1 else { return }
+            guard abs(current - target) > 0.5 else { return }
             var frame = window.frame
             let newFrame = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: frame.width, height: target))
             frame.origin.y += frame.height - newFrame.height
