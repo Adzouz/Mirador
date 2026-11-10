@@ -38,6 +38,8 @@ public enum Cleanup {
     public struct WorktreeInfo: Identifiable, Hashable, Sendable {
         public var path: String
         public var branch: String?
+        /// Checked-out commit; a detached worktree's PR is found from it.
+        public var head: String
         public var branchState: BranchState?
         public var prNumber: Int?
         public var dirtyFiles: Int
@@ -53,6 +55,35 @@ public enum Cleanup {
         public var branches: [Branch]
         public var worktrees: [WorktreeInfo]
         public var scannedAt: Date
+        /// False for the instant local pass: PR states are not known yet (or carried over from the previous scan).
+        public var remoteChecked = false
+
+        public init(branches: [Branch], worktrees: [WorktreeInfo], scannedAt: Date = .now, remoteChecked: Bool = false) {
+            self.branches = branches
+            self.worktrees = worktrees
+            self.scannedAt = scannedAt
+            self.remoteChecked = remoteChecked
+        }
+
+        /// Shows the last known PR states on a fresh local pass while the remote check runs, so rows do not flicker.
+        public func carryingRemoteState(from old: Report?) -> Report {
+            guard let old, old.remoteChecked else { return self }
+            var r = self
+            let branches = Dictionary(old.branches.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+            for i in r.branches.indices {
+                guard let o = branches[r.branches[i].name], o.lastCommit == r.branches[i].lastCommit else { continue }
+                if r.branches[i].state != .gone { r.branches[i].state = o.state }
+                r.branches[i].prNumber = o.prNumber
+                r.branches[i].note = o.note
+            }
+            let worktrees = Dictionary(old.worktrees.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+            for i in r.worktrees.indices {
+                guard let o = worktrees[r.worktrees[i].path], o.head == r.worktrees[i].head else { continue }
+                r.worktrees[i].branchState = o.branchState
+                r.worktrees[i].prNumber = o.prNumber ?? r.worktrees[i].prNumber
+            }
+            return r
+        }
     }
 
     static let git = "/usr/bin/git"
@@ -67,10 +98,27 @@ public enum Cleanup {
 
     // MARK: Scan
 
+    /// Full scan: fetch + prune, then ask GitHub. Slow (network); `scanLocal` gives the list first.
     public static func scan(settings: AppSettings, running: [String]) -> Report {
         let repo = (settings.repoPath as NSString).standardizingPath
         _ = run(["fetch", "--prune", "--quiet", "origin"], in: repo)
+        var report = scanLocal(settings: settings, running: running)
+        // Squash merges are invisible to git, so ask GitHub which PR each branch (or detached HEAD) belongs to.
+        let byBranch = pullRequestStates(for: report.branches.map(\.name))
+        let detachedHeads = report.worktrees.filter { $0.branch == nil && !$0.head.isEmpty }.map(\.head)
+        let byCommit = pullRequestStates(forCommits: detachedHeads)
+        let unresolved = report.worktrees.filter { wt in
+            if let name = wt.branch { return byBranch[name] == nil }
+            return byCommit[wt.head] == nil
+        }.compactMap(\.prNumber)
+        let byNumber = pullRequestStates(forNumbers: unresolved)
+        applyRemote(byBranch: byBranch, byCommit: byCommit, byNumber: byNumber, to: &report)
+        return report
+    }
 
+    /// Branches and worktrees from disk only (no network): what git knew at the last fetch.
+    public static func scanLocal(settings: AppSettings, running: [String]) -> Report {
+        let repo = (settings.repoPath as NSString).standardizingPath
         let format = "%(refname:short)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:unix)%09%(worktreepath)"
         let raw = run(["for-each-ref", "--format=\(format)", "refs/heads"], in: repo).stdout
         var branches: [Branch] = []
@@ -79,47 +127,81 @@ public enum Cleanup {
             guard f.count >= 5, !f[0].isEmpty else { continue }
             let upstream = f[1].isEmpty ? nil : f[1]
             let gone = f[2].contains("gone")
-            branches.append(Branch(
+            var branch = Branch(
                 name: f[0], upstream: upstream,
                 lastCommit: Date(timeIntervalSince1970: TimeInterval(f[3]) ?? 0),
                 worktreePath: f[4].isEmpty ? nil : f[4],
                 state: gone ? .gone : (upstream == nil ? .localOnly : .active)
-            ))
+            )
+            if isProtectedName(branch.name) { branch.state = .active }
+            branch.protectedReason = protection(for: branch)
+            branches.append(branch)
         }
 
-        // Squash merges are invisible to git, so ask GitHub which PR each branch belongs to.
-        let prs = pullRequestStates(for: branches.map(\.name))
-        for i in branches.indices {
-            if let pr = prs[branches[i].name] {
-                branches[i].prNumber = pr.number
-                switch pr.state {
-                case "MERGED": branches[i].state = .merged
-                case "CLOSED": branches[i].state = .closed
-                default: if branches[i].state != .gone { branches[i].state = .active }
-                }
-                // Work continued after the PR ended: not stale.
-                if let ended = pr.endedAt, branches[i].state == .merged || branches[i].state == .closed,
-                   branches[i].lastCommit > ended.addingTimeInterval(60) {
-                    branches[i].state = .active
-                    branches[i].note = "New commits after #\(pr.number) was \(pr.state.lowercased())"
-                }
+        let list = Worktrees.list(settings: settings).filter { !$0.isMain }
+        // `git status` in a monorepo checkout takes a while: check them all at once.
+        var dirty = [Int](repeating: 0, count: list.count)
+        dirty.withUnsafeMutableBufferPointer { buffer in
+            let out = buffer
+            DispatchQueue.concurrentPerform(iterations: list.count) { i in
+                out[i] = run(["status", "--porcelain"], in: list[i].path).stdout.split(separator: "\n").count
             }
-            if isProtectedName(branches[i].name) { branches[i].state = .active }
-            branches[i].protectedReason = protection(for: branches[i])
         }
-
-        let worktrees = Worktrees.list(settings: settings).filter { !$0.isMain }.map { wt -> WorktreeInfo in
+        let worktrees = list.enumerated().map { i, wt -> WorktreeInfo in
             let branch = wt.branch.flatMap { name in branches.first { $0.name == name } }
-            let dirty = run(["status", "--porcelain"], in: wt.path).stdout.split(separator: "\n").count
             var info = WorktreeInfo(
-                path: wt.path, branch: wt.branch, branchState: branch?.state, prNumber: branch?.prNumber ?? wt.prNumberFromName,
-                dirtyFiles: dirty, lastActivity: LocalWork.lastCheckout(wt.path)
+                path: wt.path, branch: wt.branch, head: wt.head, branchState: branch?.state,
+                prNumber: branch?.prNumber ?? wt.prNumberFromName,
+                dirtyFiles: dirty[i], lastActivity: LocalWork.lastCheckout(wt.path)
             )
             if running.contains(wt.path) { info.protectedReason = "Environment running" }
             return info
         }
+        return Report(branches: branches.sorted { $0.lastCommit > $1.lastCommit }, worktrees: worktrees)
+    }
 
-        return Report(branches: branches.sorted { $0.lastCommit > $1.lastCommit }, worktrees: worktrees, scannedAt: .now)
+    static func state(of pr: PRState) -> BranchState {
+        switch pr.state {
+        case "MERGED": .merged
+        case "CLOSED": .closed
+        default: .active
+        }
+    }
+
+    /// Merges GitHub's answers into a local pass. Pure, so the rules are testable without the network.
+    static func applyRemote(byBranch: [String: PRState], byCommit: [String: PRState], byNumber: [Int: PRState] = [:],
+                            to report: inout Report) {
+        for i in report.branches.indices {
+            guard let pr = byBranch[report.branches[i].name] else { continue }
+            report.branches[i].prNumber = pr.number
+            let derived = state(of: pr)
+            if derived != .active || report.branches[i].state != .gone { report.branches[i].state = derived }
+            // Work continued after the PR ended: not stale.
+            if let ended = pr.endedAt, derived != .active, report.branches[i].lastCommit > ended.addingTimeInterval(60) {
+                report.branches[i].state = .active
+                report.branches[i].note = "New commits after #\(pr.number) was \(pr.state.lowercased())"
+            }
+            if isProtectedName(report.branches[i].name) { report.branches[i].state = .active }
+        }
+        for i in report.worktrees.indices {
+            if let name = report.worktrees[i].branch {
+                let branch = report.branches.first { $0.name == name }
+                if branch?.prNumber == nil, let pr = report.worktrees[i].prNumber.flatMap({ byNumber[$0] }) {
+                    // A local name like `pr-12345` matches no PR head: use the number in the folder name.
+                    report.worktrees[i].branchState = state(of: pr)
+                } else {
+                    report.worktrees[i].branchState = branch?.state
+                    report.worktrees[i].prNumber = branch?.prNumber ?? report.worktrees[i].prNumber
+                }
+            } else if let pr = byCommit[report.worktrees[i].head] ?? report.worktrees[i].prNumber.flatMap({ byNumber[$0] }) {
+                // Detached (`gh pr checkout` of a fork, or its branch deleted): the PR whose commits it sits on, else the
+                // `pr-<number>` in the folder name. The commit wins: a folder can be reused for another PR.
+                report.worktrees[i].branchState = state(of: pr)
+                report.worktrees[i].prNumber = pr.number
+            }
+        }
+        report.scannedAt = .now
+        report.remoteChecked = true
     }
 
     static func protection(for b: Branch) -> String? {
@@ -129,6 +211,57 @@ public enum Cleanup {
     }
 
     struct PRState { var number: Int; var state: String; var endedAt: Date? }
+
+    static func pullRequestStates(forNumbers numbers: [Int]) -> [Int: PRState] {
+        struct Node: Decodable { var number: Int; var state: String; var mergedAt: Date?; var closedAt: Date? }
+        struct Body: Decodable { var repository: [String: Node?] }
+        var out: [Int: PRState] = [:]
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let unique = Array(Set(numbers)).sorted()
+        for start in stride(from: 0, to: unique.count, by: 40) {
+            let chunk = Array(unique[start..<min(start + 40, unique.count)])
+            let fields = chunk.map { "n\($0): pullRequest(number: \($0)) { number state mergedAt closedAt }" }.joined(separator: "\n")
+            let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields) } }"
+            let r = Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"])
+            guard let env = try? decoder.decode(GraphQLEnvelope<Body>.self, from: Data(r.stdout.utf8)),
+                  let repo = env.data?.repository else { continue }
+            for n in chunk {
+                if let node = repo["n\(n)"] ?? nil {
+                    out[n] = PRState(number: node.number, state: node.state, endedAt: node.mergedAt ?? node.closedAt)
+                }
+            }
+        }
+        return out
+    }
+
+    /// Latest PR containing each commit (detached worktrees), 40 commits per GraphQL request.
+    static func pullRequestStates(forCommits shas: [String]) -> [String: PRState] {
+        struct Node: Decodable { var number: Int; var state: String; var mergedAt: Date?; var closedAt: Date? }
+        struct Conn: Decodable { var nodes: [Node] }
+        struct Commit: Decodable { var associatedPullRequests: Conn? }
+        struct Body: Decodable { var repository: [String: Commit?] }
+        var out: [String: PRState] = [:]
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let unique = Array(Set(shas.filter { $0.allSatisfy(\.isHexDigit) })).sorted()
+        for start in stride(from: 0, to: unique.count, by: 40) {
+            let chunk = Array(unique[start..<min(start + 40, unique.count)])
+            let fields = chunk.enumerated().map { i, sha in
+                "c\(i): object(oid: \"\(sha)\") { ... on Commit { associatedPullRequests(first: 1, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number state mergedAt closedAt } } } }"
+            }.joined(separator: "\n")
+            let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields) } }"
+            let r = Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"])
+            guard let env = try? decoder.decode(GraphQLEnvelope<Body>.self, from: Data(r.stdout.utf8)),
+                  let repo = env.data?.repository else { continue }
+            for (i, sha) in chunk.enumerated() {
+                if let node = repo["c\(i)"]??.associatedPullRequests?.nodes.first {
+                    out[sha] = PRState(number: node.number, state: node.state, endedAt: node.mergedAt ?? node.closedAt)
+                }
+            }
+        }
+        return out
+    }
 
     /// Latest PR per head branch name, 40 branches per GraphQL request.
     static func pullRequestStates(for names: [String]) -> [String: PRState] {
