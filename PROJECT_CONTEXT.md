@@ -89,8 +89,8 @@ The menu bar panel cannot be opened from a script.
 
 ## Current state
 
-- `main` has two commits; much recent work (focus mode, Up next, auto-archive / History, monorepo-free task
-  environments, Cleanup local-first scan, ping search / mark read) is **uncommitted** until the maintainer commits it.
+- The work since v0.1.0 (focus mode, Up next, auto-archive / History, task links, monorepo-free task environments,
+  Cleanup local-first scan, ping search / mark read) is on branch `feat/v0.2-work`, PR #1, not merged yet.
 - Unverified end to end: an actual Sparkle in-app update (needs a second release).
 - `docs/images/` screenshots predate focus mode, Up next and History.
 
@@ -98,5 +98,5 @@ The menu bar panel cannot be opened from a script.
 
 Only build these when asked.
 
-- Commit the recent work in topic-sized commits and cut v0.2.0.
+- Cut v0.2.0 once PR #1 is merged.
 - Refresh README screenshots.
