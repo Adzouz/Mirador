@@ -152,6 +152,8 @@ private func pr(
     #expect(LinkParser.parse("cms-42") == .linear("CMS-42"))
     #expect(LinkParser.parse("hello world") == nil)
     #expect(LinkParser.parse("https://github.com/other/repo/pull/1") == nil)
+    #expect(LinkParser.parse("https://github.com/strapi/strapi/issues/24001") == .githubIssue(24001))
+    #expect(LinkParser.parse("https://github.com/other/repo/issues/1") == nil)
 }
 
 @Test func worktreeMatchesByLinearKeyInFolderName() {
@@ -160,6 +162,22 @@ private func pr(
     task.branch = "fix/cms-123-upload-progress"
     let wts = [Worktree(path: "/wt/cms-123", branch: "fix/cms-122-other", head: "", isMain: false)]
     #expect(Worktrees.match(task, in: wts)?.path == "/wt/cms-123")
+}
+
+@Test func taskNeverResolvesToTheMonorepoCheckout() {
+    var task = TrackedTask(kind: .fix, title: "x", source: "test")
+    task.branch = "fix/cms-5-thing"
+    task.worktreePath = "/repo"
+    let repo = Worktree(path: "/repo", branch: "fix/cms-5-thing", head: "", isMain: true)
+    #expect(Worktrees.resolve(task, in: [repo]) == nil)
+    let own = Worktree(path: "/wt/cms-5", branch: "fix/cms-5-thing", head: "", isMain: false)
+    #expect(Worktrees.resolve(task, in: [repo, own])?.path == "/wt/cms-5")
+
+    var data = StoreData()
+    data.seenBranches = []
+    LocalWork.apply(worktrees: [Worktree(path: "/repo", branch: "fix/cms-6-other", head: "", isMain: true)], activity: [:], to: &data)
+    #expect(data.tasks.count == 1)
+    #expect(data.tasks[0].worktreePath == nil)
 }
 
 @Test func newLocalBranchBecomesTask() {
@@ -471,4 +489,299 @@ private func pr(
     #expect(LinearKey.find(in: "feat/dx-12-docs", prefixes: s.teamKeys) == "DX-12")
     #expect(LinearKey.find(in: "fix/cms-123-x", prefixes: s.teamKeys) == "CMS-123")
     #expect(LinearKey.find(in: "fix/upgrade-vite-6", prefixes: s.teamKeys) == nil)
+}
+
+@Test func portCheckSeesIPv6OnlyListener() throws {
+    let fd = socket(AF_INET6, SOCK_STREAM, 0)
+    #expect(fd >= 0)
+    defer { close(fd) }
+    var addr = sockaddr_in6()
+    addr.sin6_family = sa_family_t(AF_INET6)
+    addr.sin6_port = 0
+    addr.sin6_addr = in6addr_loopback
+    let bound = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
+    }
+    #expect(bound == 0)
+    #expect(listen(fd, 1) == 0)
+    var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+    _ = withUnsafeMutablePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+    }
+    let port = Int(UInt16(bigEndian: addr.sin6_port))
+    #expect(EnvironmentRunner.isPortOpen(port: port))
+}
+
+private func focusTask(_ kind: TaskKind, _ status: TaskStatus, _ title: String, since: TimeInterval = 0, author: String? = nil) -> TrackedTask {
+    var t = TrackedTask(kind: kind, title: title, status: status, source: "test")
+    t.history = [StatusChange(status: status, at: Date(timeIntervalSince1970: 1_000_000 + since), source: "test")]
+    if let author { t.prNumber = 1; t.prAuthor = author }
+    return t
+}
+
+@Test func focusOrdersBySteps() {
+    var red = focusTask(.fix, .waitingForReview, "red CI", author: "me")
+    red.ci = CIStatus(state: .failing, total: 3, failing: ["unit"], pending: [], expected: [])
+    let tasks = [
+        focusTask(.fix, .todo, "todo"),
+        focusTask(.review, .toReview, "new review"),
+        focusTask(.review, .reReview, "re-review"),
+        focusTask(.fix, .changesRequested, "changes", author: "me"),
+        focusTask(.fix, .approved, "approved", author: "me"),
+        focusTask(.fix, .waitingForReview, "waiting", author: "me"),
+        focusTask(.review, .waitingOnAuthor, "on author"),
+        focusTask(.fix, .blocked, "blocked"),
+        red,
+    ]
+    let queue = Focus.queue(tasks, me: "me")
+    #expect(queue.map(\.task.title) == ["red CI", "changes", "re-review", "approved", "new review", "todo"])
+    #expect(Set(Focus.waitingOnOthers(tasks, me: "me").map(\.title)) == ["waiting", "on author"])
+}
+
+@Test func focusPutsUrgentFirstThenPriorityThenOldest() {
+    var urgent = focusTask(.fix, .todo, "urgent todo")
+    urgent.linearPriority = 1
+    var high = focusTask(.review, .toReview, "high review", since: 50)
+    high.linearPriority = 2
+    let tasks = [
+        focusTask(.review, .toReview, "newer review", since: 20),
+        focusTask(.review, .toReview, "older review", since: 10),
+        high,
+        urgent,
+    ]
+    #expect(Focus.queue(tasks, me: "me").map(\.task.title) == ["urgent todo", "high review", "older review", "newer review"])
+}
+
+@Test func snoozeHidesUntilDateOrStatusChange() {
+    var t = focusTask(.review, .toReview, "review")
+    t.snoozedUntil = Date(timeIntervalSince1970: 2_000_000)
+    #expect(Focus.queue([t], me: "me", now: Date(timeIntervalSince1970: 1_500_000)).isEmpty)
+    #expect(Focus.queue([t], me: "me", now: Date(timeIntervalSince1970: 2_500_000)).count == 1)
+    t.setStatus(.reReview, source: "github")
+    #expect(t.snoozedUntil == nil)
+}
+
+@Test func placeholderTitlesTakeThePRTitle() throws {
+    var untitled = TrackedTask(kind: .review, title: TrackedTask.untitled, status: .reviewing, source: "claude")
+    untitled.prNumber = 1
+    var fromBranch = TrackedTask(kind: .fix, title: LocalWork.title(from: "fix/cms-42-thing"), status: .inProgress, source: "local")
+    fromBranch.branch = "fix/cms-42-thing"
+    let named = TrackedTask(kind: .fix, title: "My own name", status: .inProgress, source: "manual")
+    #expect(untitled.hasPlaceholderTitle && fromBranch.hasPlaceholderTitle && !named.hasPlaceholderTitle)
+
+    for task in [untitled, fromBranch] {
+        var data = StoreData()
+        data.tasks = [task]
+        GitHubSync.apply(.init(me: "me", authored: [try pr()], requested: [], reviewed: []), to: &data, worktrees: [])
+        #expect(data.tasks[0].title == "fix: thing")
+    }
+
+    var kept = named
+    kept.prNumber = 1
+    var data = StoreData()
+    data.tasks = [kept]
+    GitHubSync.apply(.init(me: "me", authored: [try pr()], requested: [], reviewed: []), to: &data, worktrees: [])
+    #expect(data.tasks[0].title == "My own name")
+}
+
+@Test func pingSearchMatchesPRNumberExactlyAndWords() {
+    let review = Ping(id: "a", reason: .reviewRequested, title: "fix(upload): keep focal point", url: "https://github.com/strapi/strapi/pull/28344", prNumber: 28344, actor: "nclsndr")
+    let mention = Ping(id: "b", reason: .mention, title: "feat: other thing", url: "https://github.com/strapi/strapi/pull/2834", prNumber: 2834, actor: "innerdvations")
+    let linear = Ping(id: "c", reason: .linearMention, title: "CMS-1778 Content API folders", url: "https://linear.app/strapi/issue/CMS-1778", prNumber: nil)
+    let all = [review, mention, linear]
+    #expect(all.filter { $0.matches("#28344") }.map(\.id) == ["a"])
+    #expect(all.filter { $0.matches("2834") }.map(\.id) == ["b"])
+    #expect(all.filter { $0.matches("@nclsndr") }.map(\.id) == ["a"])
+    #expect(all.filter { $0.matches("upload focal") }.map(\.id) == ["a"])
+    #expect(all.filter { $0.matches("cms-1778") }.map(\.id) == ["c"])
+    #expect(all.filter { $0.matches("  ") }.count == 3)
+}
+
+@Test func detachedWorktreeGetsItsPRStateFromHead() {
+    let t = Date(timeIntervalSince1970: 1_000)
+    var report = Cleanup.Report(
+        branches: [Cleanup.Branch(name: "fix/a", upstream: "origin/fix/a", lastCommit: t, state: .active)],
+        worktrees: [
+            Cleanup.WorktreeInfo(path: "/wt/a", branch: "fix/a", head: "aaa", dirtyFiles: 0),
+            Cleanup.WorktreeInfo(path: "/wt/pr-1", branch: nil, head: "bbb", dirtyFiles: 0),
+            Cleanup.WorktreeInfo(path: "/wt/local", branch: nil, head: "ccc", dirtyFiles: 0),
+            Cleanup.WorktreeInfo(path: "/wt/pr-9", branch: nil, head: "ddd", prNumber: 9, dirtyFiles: 0),
+            Cleanup.WorktreeInfo(path: "/wt/pr-9b", branch: "pr-9", head: "eee", prNumber: 9, dirtyFiles: 0),
+        ]
+    )
+    let merged = Cleanup.PRState(number: 7, state: "MERGED", endedAt: t.addingTimeInterval(3600))
+    Cleanup.applyRemote(byBranch: ["fix/a": merged], byCommit: ["bbb": Cleanup.PRState(number: 1, state: "CLOSED", endedAt: t)],
+                        byNumber: [9: Cleanup.PRState(number: 9, state: "MERGED", endedAt: t)], to: &report)
+    #expect(report.remoteChecked)
+    #expect(report.branches[0].state == .merged)
+    #expect(report.worktrees.map(\.branchState) == [.merged, .closed, nil, .merged, .merged])
+    #expect(report.worktrees.map(\.prNumber) == [7, 1, nil, 9, 9])
+}
+
+@Test func localPassKeepsPreviousRemoteStateOnlyWhenUnchanged() {
+    let t = Date(timeIntervalSince1970: 1_000)
+    var old = Cleanup.Report(
+        branches: [Cleanup.Branch(name: "fix/a", lastCommit: t, state: .merged, prNumber: 7),
+                   Cleanup.Branch(name: "fix/b", lastCommit: t, state: .merged, prNumber: 8)],
+        worktrees: [Cleanup.WorktreeInfo(path: "/wt/pr-1", branch: nil, head: "bbb", branchState: .closed, prNumber: 1, dirtyFiles: 0)]
+    )
+    old.remoteChecked = true
+    let fresh = Cleanup.Report(
+        branches: [Cleanup.Branch(name: "fix/a", lastCommit: t, state: .active),
+                   Cleanup.Branch(name: "fix/b", lastCommit: t.addingTimeInterval(60), state: .active)],
+        worktrees: [Cleanup.WorktreeInfo(path: "/wt/pr-1", branch: nil, head: "bbb", dirtyFiles: 0)]
+    ).carryingRemoteState(from: old)
+    #expect(!fresh.remoteChecked)
+    #expect(fresh.branches.map(\.state) == [.merged, .active])
+    #expect(fresh.worktrees[0].branchState == .closed)
+}
+
+@Test func focusModeKeepsCurrentTaskAndSkipsToNext() {
+    let review = focusTask(.review, .toReview, "review", since: 10)
+    let fix = focusTask(.fix, .changesRequested, "fix", author: "me")
+    var urgent = focusTask(.fix, .todo, "urgent")
+    urgent.linearPriority = 1
+    var queue = Focus.queue([review, fix], me: "me")
+    #expect(Focus.pick(queue, current: nil, skipped: [])?.task.title == "fix")
+    // An urgent task arriving mid-work waits for the current one.
+    queue = Focus.queue([review, fix, urgent], me: "me")
+    #expect(Focus.pick(queue, current: fix.id, skipped: [])?.task.title == "fix")
+    // Skipping moves on; the current one leaving the queue does too.
+    #expect(Focus.pick(queue, current: fix.id, skipped: [fix.id])?.task.title == "urgent")
+    queue = Focus.queue([review, urgent], me: "me")
+    #expect(Focus.pick(queue, current: fix.id, skipped: [urgent.id])?.task.title == "review")
+    #expect(Focus.pick(queue, current: nil, skipped: [urgent.id, review.id]) == nil)
+    #expect(Focus.pruneSkipped([fix.id, review.id], queue: queue) == [review.id])
+}
+
+@Test func finishedWorkIsArchivedOnceAndUnarchiveSticks() {
+    var data = StoreData()
+    var merged = TrackedTask(kind: .review, title: "merged", status: .toReview, source: "test")
+    merged.prNumber = 1
+    merged.setStatus(.merged, source: "github")
+    var ticketDone = TrackedTask(kind: .fix, title: "ticket", status: .waitingForReview, source: "test")
+    ticketDone.linearState = "Done"
+    var prOpenTicketDone = TrackedTask(kind: .fix, title: "pr open", status: .waitingForReview, source: "test")
+    prOpenTicketDone.prNumber = 2
+    prOpenTicketDone.linearState = "Done"
+    let active = TrackedTask(kind: .fix, title: "active", status: .inProgress, source: "test")
+    data.tasks = [merged, ticketDone, prOpenTicketDone, active]
+    #expect(data.openPRNumbers == [2])
+
+    #expect(Archive.apply(to: &data) == 2)
+    #expect(data.tasks.map(\.archived) == [true, true, false, false])
+    #expect(data.tasks[0].archivedAt != nil)
+
+    data.tasks[0].setArchived(false)
+    #expect(Archive.apply(to: &data) == 0)
+    // A new status starts over: when it ends again, it is archived again.
+    data.tasks[0].setStatus(.reviewing, source: "test")
+    data.tasks[0].setStatus(.closed, source: "github")
+    #expect(Archive.apply(to: &data) == 1)
+}
+
+@Test func trackedPRMissingFromSearchesGetsItsEndState() throws {
+    var data = StoreData()
+    var t = TrackedTask(kind: .review, title: "x", status: .toReview, source: "test")
+    t.prNumber = 42
+    t.lastGitHubStatus = .toReview
+    data.tasks = [t]
+    let json = #"{"number":42,"title":"x","url":"u","state":"MERGED","isDraft":false,"merged":true,"headRefName":"b","isCrossRepository":false,"createdAt":"2026-01-01T00:00:00Z","author":{"login":"other"},"commits":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[]},"labels":{"nodes":[]}}"#
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let pr = try decoder.decode(PullRequest.self, from: Data(json.utf8))
+    var snap = GitHubSync.Snapshot(me: "me", authored: [], requested: [], reviewed: [])
+    snap.tracked = [pr]
+    GitHubSync.apply(snap, to: &data, worktrees: [])
+    #expect(data.tasks[0].status == .merged)
+}
+
+private func openPR(_ number: Int, branch: String, author: String = "me") throws -> PullRequest {
+    let json = #"{"number":\#(number),"title":"fix: thing","url":"u","state":"OPEN","isDraft":false,"merged":false,"headRefName":"\#(branch)","isCrossRepository":false,"createdAt":"2026-01-01T00:00:00Z","author":{"login":"\#(author)"},"commits":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[]},"labels":{"nodes":[]}}"#
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try decoder.decode(PullRequest.self, from: Data(json.utf8))
+}
+
+@Test func linkingMergesTheTaskAlreadyHoldingTheLink() {
+    var data = StoreData()
+    var ticket = TrackedTask(kind: .fix, title: "Ticket", status: .inProgress, source: "test")
+    ticket.linearKey = "CMS-7"
+    var pr = TrackedTask(kind: .fix, title: "PR", status: .waitingForReview, source: "test")
+    pr.prNumber = 99
+    pr.notes = "from the PR task"
+    pr.worktreePath = "/wt/99"
+    data.tasks = [ticket, pr]
+
+    let merged = data.link(.pr(99), to: ticket.id)
+
+    #expect(merged == "PR")
+    #expect(data.tasks.count == 1)
+    let t = data.tasks[0]
+    #expect(t.id == ticket.id && t.prNumber == 99 && t.linearKey == "CMS-7")
+    #expect(t.status == .inProgress)
+    #expect(t.notes == "from the PR task")
+    #expect(t.worktreePath == "/wt/99")
+    #expect(t.lastGitHubStatus == nil)
+}
+
+@Test func linkingReplacesTheLinkOfTheSameType() {
+    var data = StoreData()
+    var t = TrackedTask(kind: .fix, title: "x", source: "test")
+    t.issueNumber = 1
+    t.issueState = "closed"
+    data.tasks = [t]
+    data.link(.issue(2), to: t.id)
+    #expect(data.tasks[0].issueNumber == 2)
+    #expect(data.tasks[0].issueState == nil)
+    #expect(data.tasks[0].isUnlinked(.issue(1)))
+    data.link(.issue(1), to: t.id)
+    #expect(!data.tasks[0].isUnlinked(.issue(1)))
+}
+
+@Test func unlinkedPRAndTicketAreNotAttachedAgainBySync() throws {
+    var data = StoreData()
+    var t = TrackedTask(kind: .fix, title: "Mine", status: .inProgress, source: "test")
+    t.branch = "fix/cms-5-thing"
+    t.prNumber = 10
+    t.linearKey = "CMS-5"
+    data.tasks = [t]
+    data.unlink(.pr(10), from: t.id)
+    data.unlink(.linear("CMS-5"), from: t.id)
+
+    let snap = GitHubSync.Snapshot(me: "me", authored: [try openPR(10, branch: "fix/cms-5-thing")], requested: [], reviewed: [])
+    GitHubSync.apply(snap, to: &data, worktrees: [])
+
+    let original = try #require(data.tasks.first { $0.id == t.id })
+    #expect(original.prNumber == nil)
+    #expect(original.linearKey == nil)
+    #expect(data.tasks.count == 2)
+    #expect(data.tasks.contains { $0.id != t.id && $0.prNumber == 10 })
+}
+
+@Test func linkedIssueFollowsGitHubAndClosedIssueArchives() {
+    var data = StoreData()
+    var t = TrackedTask(kind: .fix, title: TrackedTask.untitled, source: "test")
+    t.issueNumber = 321
+    data.tasks = [t]
+    var snap = GitHubSync.Snapshot(me: "me", authored: [], requested: [], reviewed: [])
+    snap.issues = [GitHubSync.Issue(number: 321, title: "Upload breaks", state: "CLOSED")]
+    GitHubSync.apply(snap, to: &data, worktrees: [])
+    #expect(data.tasks[0].issueState == "closed")
+    #expect(data.tasks[0].title == "Upload breaks")
+    #expect(data.openIssueNumbers == [321])
+    Archive.apply(to: &data)
+    #expect(data.tasks[0].archived)
+}
+
+@Test func storeWithoutLinkFieldsStillLoads() throws {
+    var data = StoreData()
+    data.tasks = [TrackedTask(kind: .fix, title: "x", source: "test")]
+    let encoded = try JSONEncoder().encode(data)
+    var json = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    var tasks = try #require(json["tasks"] as? [[String: Any]])
+    for key in ["issueNumber", "issueTitle", "issueState", "unlinked"] { tasks[0][key] = nil }
+    json["tasks"] = tasks
+    let decoded = try JSONDecoder().decode(StoreData.self, from: JSONSerialization.data(withJSONObject: json))
+    #expect(decoded.tasks[0].issueNumber == nil)
 }

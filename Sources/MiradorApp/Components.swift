@@ -124,6 +124,12 @@ struct LinkButtons: View {
                 }
                 .help("Open Linear ticket")
             }
+            if let url = task.issueURL {
+                Button { model.open(url) } label: {
+                    Label(task.issueNumber.map { "Issue #\(String($0))" } ?? "Issue", systemImage: "smallcircle.filled.circle")
+                }
+                .help(task.issueTitle.map { "Open issue: \($0)" } ?? "Open issue on GitHub")
+            }
         }
         .shadButton(compact ? .ghost : .outline)
     }
@@ -367,5 +373,48 @@ struct QAMenu: View {
                 Label(state.label, systemImage: task.qa == state ? "checkmark" : state.symbol)
             }
         }
+    }
+}
+
+/// One line per environment: status, name, port and a play / stop button. Used in the sidebar and the menu bar.
+struct EnvironmentQuickRow: View {
+    @Environment(AppModel.self) private var model
+    let path: String
+    let title: String
+    var subtitle: String?
+
+    var body: some View {
+        let state = model.state(of: path)
+        let busy = model.busyEnvironment != nil
+        HStack(spacing: 8) {
+            Circle().fill(state.color).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.foreground).lineLimit(1)
+                Muted(secondLine(state), size: 10.5).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Group {
+                if model.busyEnvironment == path {
+                    ProgressView().controlSize(.small).frame(width: 28, height: 28)
+                } else if state == .stopped || state == .crashed {
+                    Button { model.startEnvironment(path) } label: { Image(systemName: "play.fill") }
+                        .help(model.slotConflict(for: path).map { "Start (stops \(($0.worktreePath as NSString).lastPathComponent))" } ?? "Start")
+                        .disabled(busy)
+                } else {
+                    Button { model.stopEnvironment(path) } label: { Image(systemName: "stop.fill") }
+                        .help("Stop")
+                        .disabled(busy)
+                }
+            }
+            .buttonStyle(ShadButtonStyle(variant: .ghost, size: .icon))
+        }
+        .help(path)
+    }
+
+    /// ":1337 · develop", or the startup phase while it starts.
+    private func secondLine(_ state: EnvironmentState) -> String {
+        let port = ":\(String(model.port(for: path)))"
+        if state == .starting { return model.startDetails[path] ?? "\(port) · Starting…" }
+        return [port, subtitle].compactMap { $0 }.joined(separator: " · ")
     }
 }

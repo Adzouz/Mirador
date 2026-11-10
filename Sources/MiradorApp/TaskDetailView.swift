@@ -12,6 +12,7 @@ struct TaskDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
+                if task.archived { archivedNote }
                 ProgressCard(task: task)
                 if let ci = task.ci, !task.status.isFinished { CICard(task: task, ci: ci) }
                 if let steps = task.testSteps { TestStepsCard(steps: steps) }
@@ -40,16 +41,16 @@ struct TaskDetailView: View {
                 HStack(spacing: 8) {
                     propertyMenus
                     Spacer(minLength: 8)
-                    LinkButtons(task: task).fixedSize()
+                    links
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) { propertyMenus }
-                    LinkButtons(task: task).fixedSize()
+                    links
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) { kindAndStatusMenus }
                     HStack(spacing: 8) { priorityAndQAMenus }
-                    LinkButtons(task: task).fixedSize()
+                    links
                 }
             }
 
@@ -63,6 +64,25 @@ struct TaskDetailView: View {
 
             PropertiesGrid(task: task, me: model.me)
         }
+    }
+
+    private var links: some View {
+        HStack(spacing: 6) {
+            LinkButtons(task: task)
+            ShadMenu {
+                Button("Link a PR, issue or ticket…") { model.showLink(task.id) }
+                if !task.links.isEmpty {
+                    Divider()
+                    ForEach(task.links, id: \.self) { link in
+                        Button("Remove \(link.label)") { model.unlink(link, from: task.id) }
+                    }
+                }
+            } label: {
+                Image(systemName: "link")
+            }
+            .help("Link a PR, issue or Linear ticket")
+        }
+        .fixedSize()
     }
 
     @ViewBuilder
@@ -128,6 +148,18 @@ struct TaskDetailView: View {
         return list
     }
 
+    private var archivedNote: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "archivebox").foregroundStyle(Theme.mutedForeground)
+            Muted(task.archivedAt.map { "Archived \($0.formatted(.relative(presentation: .named)))" } ?? "Archived", size: 12)
+            Spacer()
+            Button("Unarchive") { model.mutate(task.id) { $0.setArchived(false) } }.shadButton(.outline)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Theme.muted, in: RoundedRectangle(cornerRadius: Theme.radius))
+    }
+
     private var worktreeCard: some View {
         Card {
             if let wt = model.worktree(for: task) {
@@ -138,8 +170,12 @@ struct TaskDetailView: View {
                 EnvironmentControls(path: wt.path)
             } else {
                 let creating = model.creatingWorktree.contains(task.id)
+                let inMonorepo = task.branch != nil && model.worktrees.contains { $0.isMain && $0.branch == task.branch }
+                let target = "\((model.settings.worktreesPath as NSString).abbreviatingWithTildeInPath)/\(WorktreeCreator.folderName(for: task))"
                 CardHeader(title: "Local environment",
-                           description: creating ? "Creating the worktree…" : "No worktree yet. Create one in \((model.settings.worktreesPath as NSString).abbreviatingWithTildeInPath)/\(WorktreeCreator.folderName(for: task)) to test it.") {
+                           description: creating ? "Creating the worktree…"
+                               : inMonorepo ? "Checked out in the monorepo, which is shared by every task. Create its own worktree in \(target)."
+                               : "No worktree yet. Create one in \(target) to test it.") {
                     Button { model.createWorktree(for: task) } label: {
                         if creating { ProgressView().controlSize(.small) } else { Label("Create worktree", systemImage: "plus.rectangle.on.folder") }
                     }
@@ -147,7 +183,7 @@ struct TaskDetailView: View {
                     .disabled(creating)
                     .help(task.prNumber != nil ? "git worktree add + gh pr checkout \(String(task.prNumber!))" : "git worktree add on \(WorktreeCreator.branchName(for: task))")
                     ShadMenu {
-                        ForEach(model.worktrees) { wt in
+                        ForEach(model.worktrees.filter { !$0.isMain }) { wt in
                             Button("\(wt.name) — \(wt.branch ?? "detached")") {
                                 model.mutate(task.id) {
                                     $0.worktreePath = wt.path
@@ -323,6 +359,12 @@ struct PropertiesGrid: View {
         }
         if let state = task.linearState {
             list.append(Item(id: "Linear", symbol: "circle.hexagongrid", value: AnyView(Text(state))))
+        }
+        if task.issueNumber != nil {
+            let state = task.issueState.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? "Issue"
+            list.append(Item(id: "Issue", symbol: "smallcircle.filled.circle", value: AnyView(
+                Text(task.issueTitle.map { "\(state) · \($0)" } ?? state).lineLimit(1).truncationMode(.tail).help(task.issueTitle ?? "")
+            )))
         }
         return list
     }
