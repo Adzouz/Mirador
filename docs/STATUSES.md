@@ -40,6 +40,32 @@ Any task can also be **Blocked** or **Closed**.
 5. Otherwise I spoke last → **Waiting on author** (a pending re-request alone does not flip it: GitHub keeps the
    request when I answer with a plain comment).
 
+## Archive
+
+`Archive.apply` runs after each sync. A task is archived when its status is Merged, Released or Closed, or — only for
+tasks without a PR — its Linear ticket is Done, Canceled or Duplicate, or, with no Linear ticket either, its linked
+GitHub issue is closed. `archivedAt` records when. Unarchiving keeps
+`archivedAt`, so the task stays out of the archive until its status changes again. **History** lists archived and
+finished tasks, most recently archived first.
+
+## Up next and focus mode (`Focus.queue`)
+
+Only tasks waiting on me, ordered by step, then Linear priority (urgent always first), then the oldest wait:
+
+| Step | Task |
+| --- | --- |
+| 0 | My PR with failing CI (not a draft) |
+| 1 | Changes requested · Addressing review |
+| 2 | Re-review (reviews) |
+| 3 | My approved PR (QA, then merge) |
+| 4 | Reviewing · Taken over |
+| 5 | Done locally · In progress · my Draft PR |
+| 6 | To review |
+| 7 | To do |
+
+Waiting for review, In review, Waiting on author, Blocked and finished tasks are excluded (waiting on others).
+Snoozed tasks are hidden until their date or their next status change.
+
 ## QA
 
 Separate from the status: **QA pending** (default for any task with a PR), **QA done** (`qa-done`, legacy
