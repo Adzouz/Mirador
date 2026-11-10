@@ -51,7 +51,8 @@ public enum AgentGuide {
 
     | Need | Command |
     | --- | --- |
-    | Track a PR or ticket | `mirador add <GitHub PR or Linear URL>` |
+    | Track a PR, issue or ticket | `mirador add <GitHub PR, GitHub issue or Linear URL>` |
+    | Link the current task to a PR, issue or ticket | `mirador link [ref] --pr <n> \\| --issue <n> \\| --linear CMS-123` |
     | Create its worktree (`gh pr checkout` for PRs) | `mirador worktree <PR number or CMS key>` |
     | Start it (installs + builds on first run) | `mirador env start <path>` |
     | Create the super admin from Settings on a fresh app | `mirador admin <path>` |
@@ -62,7 +63,7 @@ public enum AgentGuide {
 
     ## Other commands
 
-    `mirador show`, `mirador list`, `mirador link --pr <n>`, `mirador sync`, `mirador cleanup` (read-only report;
+    `mirador show`, `mirador list`, `mirador link --unlink pr|issue|linear`, `mirador sync`, `mirador cleanup` (read-only report;
     deleting branches or worktrees is done by the user in the app, never by an agent). `mirador help` lists everything.
     """
 

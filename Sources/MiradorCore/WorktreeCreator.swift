@@ -4,11 +4,13 @@ import Foundation
 public enum WorktreeCreator {
     public enum CreateError: LocalizedError {
         case exists(String)
+        case checkedOut(branch: String, at: String)
         case git(String)
 
         public var errorDescription: String? {
             switch self {
             case .exists(let p): "\(p) already exists"
+            case .checkedOut(let b, let p): "\(b) is checked out in \((p as NSString).abbreviatingWithTildeInPath). Switch that checkout to another branch (e.g. develop) first."
             case .git(let m): m
             }
         }
@@ -47,12 +49,15 @@ public enum WorktreeCreator {
         let path = (folder as NSString).appendingPathComponent(folderName(for: task))
         guard !FileManager.default.fileExists(atPath: path) else { throw CreateError.exists(path) }
 
+        // git refuses a branch already checked out elsewhere (often the monorepo itself).
+        let holder = task.branch.flatMap { branch in Worktrees.list(settings: settings).first { $0.branch == branch } }
+
         try git(["fetch", "--quiet", "origin", "develop"], in: repo)
 
         if let pr = task.prNumber {
             // gh handles forks and names the branch like the PR head.
             try git(["worktree", "add", "--detach", path, "origin/develop"], in: repo)
-            let r = Shell.run("gh", ["pr", "checkout", String(pr), "--repo", GitHubSync.repo], cwd: path)
+            let r = Shell.run("gh", ["pr", "checkout", String(pr), "--repo", GitHubSync.repo] + (holder != nil ? ["--detach"] : []), cwd: path)
             guard r.status == 0 else {
                 _ = try? git(["worktree", "remove", "--force", path], in: repo)
                 throw CreateError.git(r.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -61,6 +66,7 @@ public enum WorktreeCreator {
         }
 
         let branch = branchName(for: task)
+        if let holder { throw CreateError.checkedOut(branch: branch, at: holder.path) }
         let hasLocal = Shell.run("git", ["-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/\(branch)"]).status == 0
         if hasLocal {
             try git(["worktree", "add", path, branch], in: repo)

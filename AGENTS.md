@@ -3,6 +3,17 @@
 Guidance for AI agents (and humans) changing Mirador's code. For *using* Mirador from an agent while working on
 Strapi, see [docs/AGENTS_INTEGRATION.md](docs/AGENTS_INTEGRATION.md) or run `mirador guide`.
 
+## Start here
+
+1. [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md): why it exists, product principles, feature map, runtime paths, current
+   state, how to verify UI.
+2. This file: rules and gotchas.
+3. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (sync, environments, cleanup, focus) and
+   [docs/STATUSES.md](docs/STATUSES.md) (status rules, archive, focus ranking) before touching those areas.
+
+Keep these files true: when a change alters behaviour they describe, update them in the same change (README feature
+list included). Add a gotcha below when you lose time to something non-obvious.
+
 ## What this is
 
 A native macOS desktop app (SwiftUI window + menu bar panel) and a CLI that track a developer's work on `strapi/strapi`.
@@ -10,7 +21,7 @@ Swift Package Manager only — no Xcode project. Read [docs/ARCHITECTURE.md](doc
 
 | Path | What |
 | --- | --- |
-| `Sources/MiradorCore` | All logic: models, store, GitHub / Linear sync, pings, worktrees, environment runner, cleanup. No UI. |
+| `Sources/MiradorCore` | All logic: models, store, GitHub / Linear sync, pings, worktrees, environment runner, cleanup, focus, archive. No UI. |
 | `Sources/MiradorApp` | SwiftUI app. Views + `AppModel` (main-actor state, timers, calls into Core). |
 | `Sources/mirador` | The CLI (`main.swift`), a thin layer over Core. |
 | `Tests/MiradorCoreTests` | Swift Testing (`@Test`) suite for Core. |
@@ -55,12 +66,17 @@ swift test                  # must stay green; add a test for every rule you add
   (`CIStatus.expectedRed`), bot logins (`GitHubSync.bots`), PR template headings (`TestSteps.headings`), build markers
   (`EnvironmentRunner`).
 - Comments: only where the code cannot say it (a non-obvious constraint or a GitHub / Strapi quirk).
+- **Verify before claiming.** Run `swift test`; for UI, install and screenshot (see PROJECT_CONTEXT.md). Say which
+  clicks you could not try. Never commit, push or open PRs unless the maintainer asks.
+- **User-facing copy** is short and plain: sentence case, no jargon, no counts that add pressure.
 
 ## Gotchas already paid for
 
 - GitHub notification `reason` is sticky (a thread stays "mention" forever) and threads also update on pushes; only
   unread ones are listed. Mention pings therefore require an actual new comment containing `@login`.
 - Strapi squash-merges: git cannot tell a branch was merged. Cleanup asks GitHub for the PR by `headRefName`.
+- Worktrees made by `gh pr checkout` are often detached or on a local `pr-<number>` branch: Cleanup finds their PR from
+  the HEAD commit, then from the folder name. Folders get reused for other PRs, so the commit wins.
 - CI rollups for 50 PRs in one GraphQL search time out (HTTP 504): CI is fetched separately, 10 PRs per query.
 - PR bodies use CRLF line endings; normalize before parsing sections.
 - `node_modules` existing does not mean installed: `node_modules/.yarn-state.yml` is written at the end of an install.
@@ -69,4 +85,14 @@ swift test                  # must stay green; add a test for every rule you add
 - Sparkle is an SPM binary target: `build-app.sh` copies `Sparkle.framework` into `Contents/Frameworks` (the
   executable has an `@executable_path/../Frameworks` rpath) and, when signing, signs its XPC services and helpers
   inside-out before the app. The updater only starts when `Info.plist` has `SUFeedURL`.
-- macOS paths can differ by symlink (`/var` vs `/private/var`): compare resolved paths.
+- Strapi with `HOST=localhost` can listen on `[::1]` only: the port check tries IPv4 and IPv6 loopback.
+- Tasks never resolve to the monorepo checkout (`Worktrees.resolve`): it is shared and switches branches, so a stale
+  `worktreePath` pointing at it showed another task's environment. Creating a worktree for a branch the monorepo holds
+  uses `gh pr checkout --detach` (PRs) or explains how to free the branch.
+- The GitHub searches drop a PR once it is closed or the review request is gone, so its task never learned it merged.
+  `fetch(tracking:)` looks up open tasks' PRs the searches missed by number and applies only their end state.
+- macOS paths can differ by symlink (`/var` vs `/private/var`): compare resolved paths (`Worktrees.samePath`).
+- `gh api graphql` exits non-zero when one alias of a batch fails (a number that is not a PR / issue) but still prints
+  the others: decode stdout anyway (`GitHubSync.batch`), never gate on the exit status.
+- Every commit on develop is "associated" with the merged PR that brought it. A detached worktree belongs to a PR only
+  when HEAD is that PR's `headRefOid` (`Cleanup.pullRequest(at:among:)`).

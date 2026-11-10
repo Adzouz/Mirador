@@ -72,6 +72,64 @@ final class AppModel {
         settings = data.settings
         linearAuthFailed = data.linearAuthFailed == true
         storeModified = modificationDate()
+        if focusMode { updateFocus() }
+    }
+
+    // MARK: Focus mode
+
+    /// One task at a time: no counts, no pings, no notifications.
+    var focusMode: Bool = UserDefaults.standard.bool(forKey: "focusMode") {
+        didSet {
+            UserDefaults.standard.set(focusMode, forKey: "focusMode")
+            if focusMode { focusTransition = nil; updateFocus() }
+        }
+    }
+    private(set) var focusTaskID: TrackedTask.ID? = UserDefaults.standard.string(forKey: "focusTask").flatMap(UUID.init) {
+        didSet { UserDefaults.standard.set(focusTaskID?.uuidString, forKey: "focusTask") }
+    }
+    /// Skipped tasks, most recent last. Out of the way, not snoozed: they come back when nothing else is left.
+    private(set) var focusSkipped: [TrackedTask.ID] = (UserDefaults.standard.stringArray(forKey: "focusSkipped") ?? []).compactMap(UUID.init) {
+        didSet { UserDefaults.standard.set(focusSkipped.map(\.uuidString), forKey: "focusSkipped") }
+    }
+    /// What happened to the task that was just in focus ("… is now Waiting for review"), shown once on the next one.
+    var focusTransition: String?
+
+    var focusItem: Focus.Item? { focusTaskID.flatMap { id in focusQueue.first { $0.id == id } } }
+    var skippedTasks: [TrackedTask] { focusSkipped.reversed().compactMap { id in tasks.first { $0.id == id } } }
+
+    private func updateFocus() {
+        let queue = focusQueue
+        let pruned = Focus.pruneSkipped(focusSkipped, queue: queue)
+        if pruned != focusSkipped { focusSkipped = pruned }
+        let next = Focus.pick(queue, current: focusTaskID, skipped: focusSkipped)?.id
+        guard next != focusTaskID else { return }
+        // The task left the user's side on its own (sync, agent, a status set by hand): say where it went.
+        if let old = focusTaskID, !focusSkipped.contains(old), let task = tasks.first(where: { $0.id == old }) {
+            focusTransition = "“\(task.title)” is now \(task.status.label.lowercased())."
+        }
+        focusTaskID = next
+    }
+
+    func skipFocus() {
+        guard let id = focusTaskID else { return }
+        focusSkipped.removeAll { $0 == id }
+        focusSkipped.append(id)
+        focusTransition = nil
+        updateFocus()
+    }
+
+    /// Brings a skipped task back as the one in focus; the current one goes on the stack.
+    func resumeSkipped(_ id: TrackedTask.ID) {
+        if let current = focusTaskID, current != id { focusSkipped.append(current) }
+        focusSkipped.removeAll { $0 == id }
+        focusTaskID = id
+        focusTransition = nil
+    }
+
+    /// Takes a task off the stack without focusing it: it is picked again in its normal turn.
+    func unskip(_ id: TrackedTask.ID) {
+        focusSkipped.removeAll { $0 == id }
+        updateFocus()
     }
 
     private func reloadIfChanged() {
@@ -106,11 +164,48 @@ final class AppModel {
         }
     }
 
+    var focusQueue: [Focus.Item] { Focus.queue(tasks, me: me) }
+    var waitingOnOthers: [TrackedTask] { Focus.waitingOnOthers(tasks, me: me) }
+    var snoozedTasks: [TrackedTask] { tasks.filter { !$0.archived && !$0.status.isFinished && $0.isSnoozed() } }
+
+    enum Snooze: CaseIterable {
+        case tomorrow, nextWeek
+
+        var label: String {
+            switch self {
+            case .tomorrow: "Until tomorrow"
+            case .nextWeek: "Until next week"
+            }
+        }
+
+        /// 9:00 tomorrow, or 9:00 next Monday.
+        var date: Date {
+            let cal = Calendar.current
+            let start = cal.startOfDay(for: .now)
+            let day: Date = switch self {
+            case .tomorrow: cal.date(byAdding: .day, value: 1, to: start)!
+            case .nextWeek: cal.nextDate(after: start, matching: DateComponents(weekday: 2), matchingPolicy: .nextTime)!
+            }
+            return cal.date(byAdding: .hour, value: 9, to: day)!
+        }
+    }
+
+    /// Not through `mutate`: snoozing is not activity on the task and must not bump `updatedAt`.
+    func snooze(_ id: TrackedTask.ID, until date: Date?) {
+        store.update { data in
+            guard let i = data.tasks.firstIndex(where: { $0.id == id }) else { return }
+            data.tasks[i].snoozedUntil = date
+        }
+        reload()
+    }
+
     func setStatus(_ id: TrackedTask.ID, _ status: TaskStatus) {
         mutate(id) { $0.setStatus(status, source: "manual") }
     }
 
     var addingTask = false
+    /// Task the link sheet is open for.
+    var linkingTask: TrackedTask.ID?
     var showingOnboarding = false
 
     func showAdd() {
@@ -129,6 +224,23 @@ final class AppModel {
         return id
     }
 
+    func showLink(_ id: TrackedTask.ID) {
+        NSApp.activate(ignoringOtherApps: true)
+        linkingTask = id
+    }
+
+    /// Links the PR / issue / ticket to the task, merging in the task that tracked it before, if any.
+    func link(_ preview: LinkPreview, to id: TrackedTask.ID) {
+        store.update { $0.link(preview.taskLink, to: id, details: preview) }
+        reload()
+        sync()
+    }
+
+    func unlink(_ link: TaskLink, from id: TrackedTask.ID) {
+        store.update { $0.unlink(link, from: id) }
+        reload()
+    }
+
     func delete(_ id: TrackedTask.ID) {
         store.update { $0.tasks.removeAll { $0.id == id } }
         reload()
@@ -143,6 +255,8 @@ final class AppModel {
     }
 
     private func notify(_ new: [Ping]) {
+        // Still recorded in Pings; just no banner while focusing.
+        guard !focusMode else { return }
         for ping in new {
             let content = UNMutableNotificationContent()
             content.title = ping.headline
@@ -160,6 +274,18 @@ final class AppModel {
 
     func deletePing(_ id: String) {
         store.update { $0.pings.removeAll { $0.id == id } }
+        reload()
+    }
+
+    func deletePings(_ ids: Set<String>) {
+        store.update { $0.pings.removeAll { ids.contains($0.id) } }
+        reload()
+    }
+
+    func markRead(_ ids: Set<String>) {
+        store.update { data in
+            for i in data.pings.indices where ids.contains(data.pings[i].id) { data.pings[i].read = true }
+        }
         reload()
     }
 
@@ -184,7 +310,7 @@ final class AppModel {
             await MainActor.run {
                 self.linearKey = key
                 self.linearKeyLoaded = true
-                if key != nil { self.sync() }
+                if key != nil { self.syncLinear() }
             }
         }
     }
@@ -192,73 +318,43 @@ final class AppModel {
     func setLinearKey(_ key: String?) {
         Keychain.write(LinearAPI.keyAccount, key)
         linearKey = key
+        linearKeyLoaded = true
+        linearConnection = .checking
+        linearError = nil
+        // With no key, syncLinear returns at once: clear the old Linear state here, not after a sync.
+        if key == nil { linearUser = nil }
+        updateErrorMessage()
         store.update { $0.linearAuthFailed = nil }
         reload()
-        if key != nil { sync() }
+        if key != nil { syncLinear() }
     }
 
     // MARK: Sync
 
-    /// GitHub, Linear and local branches, each independent so one failing does not block the others.
+    /// GitHub and local branches. Linear runs alongside on its own (`syncLinear`), so one failing or being slow
+    /// does not hold the other back.
     func sync() {
         guard !syncing else { syncAgain = true; return }
         syncing = true
+        syncLinear()
         let store = store
-        let linearKey = linearKey
         let generation = worktreesGeneration
         Task.detached {
             let worktrees = Worktrees.list(settings: store.load().settings)
             let activity = LocalWork.activity(in: worktrees)
-            var errors: [String] = []
             var pings: [Ping] = []
             var githubError: String?
-            var linearError: String?
-            var linearUser: String?
 
             do {
-                let snap = try GitHubSync.fetch()
+                let open = store.load()
+                let snap = try GitHubSync.fetch(tracking: open.openPRNumbers, issues: open.openIssueNumbers)
                 let inputs = Pings.fetch(previous: store.load())
                 pings += store.update { data in
                     GitHubSync.apply(snap, to: &data, worktrees: worktrees)
                     return Pings.apply(snapshot: snap, inputs: inputs, to: &data)
                 }
             } catch {
-                errors.append(error.localizedDescription)
                 githubError = error.localizedDescription
-            }
-
-            if let linearKey {
-                do {
-                    let snap = try LinearAPI.fetch(key: linearKey)
-                    linearUser = snap.viewerName
-                    pings += store.update { data in
-                        defer { data.lastLinearSync = .now }
-                        return LinearAPI.apply(snap, to: &data, worktrees: worktrees)
-                    }
-                    let assigned = Set(snap.assigned.map(\.identifier))
-                    let others = store.load().tasks.compactMap(\.linearKey).filter { !assigned.contains($0) }
-                    let issues = try LinearAPI.issues(others, key: linearKey)
-                    store.update {
-                        LinearAPI.refresh(issues, in: &$0)
-                        $0.linearAuthFailed = false
-                    }
-                } catch LinearAPI.LinearError.unauthorized {
-                    errors.append(LinearAPI.LinearError.unauthorized.localizedDescription)
-                    linearError = LinearAPI.LinearError.unauthorized.localizedDescription
-                    pings += store.update { data -> [Ping] in
-                        // One ping per breakage, not one per sync.
-                        guard data.linearAuthFailed != true else { return [] }
-                        data.linearAuthFailed = true
-                        let ping = Ping(id: "linear-auth-\(Int(Date().timeIntervalSince1970))", reason: .linearAuth,
-                                        title: "Open Mirador → Settings and paste a new Linear API key.",
-                                        url: "https://linear.app/settings/account/security", prNumber: nil)
-                        data.pings.insert(ping, at: 0)
-                        return [ping]
-                    }
-                } catch {
-                    errors.append(error.localizedDescription)
-                    linearError = error.localizedDescription
-                }
             }
 
             store.update { data in
@@ -266,26 +362,96 @@ final class AppModel {
                 for i in data.tasks.indices where data.tasks[i].worktreePath == nil {
                     data.tasks[i].worktreePath = Worktrees.match(data.tasks[i], in: worktrees)?.path
                 }
+                Archive.apply(to: &data)
             }
 
-            let message = errors.isEmpty ? nil : errors.joined(separator: " · ")
-            SyncLog.write(message ?? "ok")
+            SyncLog.write(githubError ?? "ok")
             let newPings = pings
-            let (ghError, lnError, lnUser) = (githubError, linearError, linearUser)
+            let ghError = githubError
             await MainActor.run {
                 self.githubConnection = ghError.map { .failed($0) } ?? .connected
-                if linearKey != nil {
-                    self.linearConnection = lnError.map { .failed($0) } ?? .connected
-                    if let lnUser { self.linearUser = lnUser }
-                }
+                self.githubError = ghError
                 self.notify(newPings)
                 self.applyWorktrees(worktrees, fetched: generation)
                 self.syncing = false
-                self.errorMessage = message
+                self.updateErrorMessage()
                 if self.syncAgain {
                     self.syncAgain = false
                     self.sync()
                 }
+                self.reload()
+            }
+        }
+    }
+
+    private var syncingLinear = false
+    private var syncLinearAgain = false
+    private var githubError: String?
+    private var linearError: String?
+
+    private func updateErrorMessage() {
+        let errors = [githubError, linearError].compactMap { $0 }
+        errorMessage = errors.isEmpty ? nil : errors.joined(separator: " · ")
+    }
+
+    /// Assigned / started tickets, priorities and mentions. Its own step so the Linear status is known within
+    /// seconds of launch instead of after the (slower) GitHub sync.
+    func syncLinear() {
+        guard let linearKey else { return }
+        guard !syncingLinear else { syncLinearAgain = true; return }
+        syncingLinear = true
+        let store = store
+        Task.detached {
+            let worktrees = Worktrees.list(settings: store.load().settings)
+            var pings: [Ping] = []
+            var linearError: String?
+            var linearUser: String?
+            do {
+                let snap = try LinearAPI.fetch(key: linearKey)
+                linearUser = snap.viewerName
+                pings += store.update { data in
+                    defer { data.lastLinearSync = .now }
+                    return LinearAPI.apply(snap, to: &data, worktrees: worktrees)
+                }
+                let assigned = Set(snap.assigned.map(\.identifier))
+                let others = store.load().tasks.compactMap(\.linearKey).filter { !assigned.contains($0) }
+                let issues = try LinearAPI.issues(others, key: linearKey)
+                store.update {
+                    LinearAPI.refresh(issues, in: &$0)
+                    Archive.apply(to: &$0)
+                    $0.linearAuthFailed = false
+                }
+            } catch LinearAPI.LinearError.unauthorized {
+                linearError = LinearAPI.LinearError.unauthorized.localizedDescription
+                pings += store.update { data -> [Ping] in
+                    // One ping per breakage, not one per sync.
+                    guard data.linearAuthFailed != true else { return [] }
+                    data.linearAuthFailed = true
+                    let ping = Ping(id: "linear-auth-\(Int(Date().timeIntervalSince1970))", reason: .linearAuth,
+                                    title: "Open Mirador → Settings and paste a new Linear API key.",
+                                    url: "https://linear.app/settings/account/security", prNumber: nil)
+                    data.pings.insert(ping, at: 0)
+                    return [ping]
+                }
+            } catch {
+                linearError = error.localizedDescription
+            }
+            if let linearError { SyncLog.write(linearError) }
+            let newPings = pings
+            let (lnError, lnUser) = (linearError, linearUser)
+            await MainActor.run {
+                self.syncingLinear = false
+                if self.syncLinearAgain {
+                    self.syncLinearAgain = false
+                    self.syncLinear()
+                }
+                // The key was removed or replaced while this ran: its result is stale.
+                guard self.linearKey == linearKey else { return }
+                self.linearConnection = lnError.map { .failed($0) } ?? .connected
+                if let lnUser { self.linearUser = lnUser }
+                self.linearError = lnError
+                self.updateErrorMessage()
+                self.notify(newPings)
                 self.reload()
             }
         }
@@ -307,8 +473,7 @@ final class AppModel {
     }
 
     func worktree(for task: TrackedTask) -> Worktree? {
-        if let path = task.worktreePath, let wt = worktrees.first(where: { $0.path == path }) { return wt }
-        return Worktrees.match(task, in: worktrees)
+        Worktrees.resolve(task, in: worktrees)
     }
 
     /// The task a worktree is for, preferring active ones.
@@ -413,6 +578,12 @@ final class AppModel {
     }
     func isMonorepo(_ path: String) -> Bool { settings.isMonorepo(path) }
     var runningPaths: [String] { running.map(\.worktreePath) }
+    /// Last Cleanup scan, shown at once when the tab is opened again.
+    var cleanupReport: Cleanup.Report?
+    /// Kept here, not in the view, so a scan started before the tab was left is still the one that counts.
+    var cleanupGeneration = 0
+    /// Fetch + GitHub pass in flight.
+    var cleanupSyncingRemote = false
 
     /// The environment running in the same slot (monorepo / worktree) as `path`, if it is a different one.
     func slotConflict(for path: String) -> RunningEnvironment? {
@@ -473,7 +644,26 @@ final class AppModel {
         Task.detached { Keychain.write(AdminBootstrap.passwordAccount, password) }
     }
 
+    /// Worktree last started (or picked) for Quickstart; the monorepo has its own slot.
+    var lastWorktreePath: String = UserDefaults.standard.string(forKey: "quickstartPath") ?? "" {
+        didSet { UserDefaults.standard.set(lastWorktreePath, forKey: "quickstartPath") }
+    }
+
+    var monorepo: Worktree? { worktrees.first { isMonorepo($0.path) } }
+
+    /// Worktrees offered in the worktree slot (the monorepo excluded).
+    var worktreeChoices: [Worktree] { startableWorktrees.filter { !isMonorepo($0.path) } }
+
+    /// The worktree for the sidebar / menu bar shortcut: the running one, else the last launched, else the first.
+    var quickWorktree: Worktree? {
+        let choices = worktreeChoices
+        if let running = running.first(where: { !isMonorepo($0.worktreePath) }),
+           let wt = choices.first(where: { $0.path == running.worktreePath }) { return wt }
+        return choices.first { $0.path == lastWorktreePath } ?? choices.first
+    }
+
     func startEnvironment(_ path: String) {
+        if !isMonorepo(path) { lastWorktreePath = path }
         busyEnvironment = path
         errorMessage = nil
         let store = store

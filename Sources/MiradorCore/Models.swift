@@ -211,6 +211,8 @@ public struct TrackedTask: Codable, Identifiable, Hashable, Sendable {
     public var worktreePath: String?
     public var notes: String
     public var archived: Bool
+    /// When it was last archived (by hand or automatically). Kept on unarchive so auto-archive does not undo it.
+    public var archivedAt: Date?
     public var createdAt: Date
     public var updatedAt: Date
     /// When the work began: PR opened, Linear ticket started, or branch checked out — the earliest known.
@@ -232,6 +234,15 @@ public struct TrackedTask: Codable, Identifiable, Hashable, Sendable {
     /// so a status set by hand or by Claude survives until something actually happens on the PR.
     public var lastGitHubStatus: TaskStatus?
     public var history: [StatusChange]
+    /// Hidden from Focus until then, or until its status changes.
+    public var snoozedUntil: Date?
+    /// GitHub issue linked by hand. Its title and state are refreshed by the GitHub sync.
+    public var issueNumber: Int?
+    public var issueTitle: String?
+    /// "open" or "closed".
+    public var issueState: String?
+    /// Links the user removed (`TaskLink.ref`). The syncs do not attach them again.
+    public var unlinked: [String]?
 
     public init(kind: TaskKind, title: String, status: TaskStatus? = nil, source: String) {
         let initial = status ?? kind.flow[0]
@@ -248,6 +259,18 @@ public struct TrackedTask: Codable, Identifiable, Hashable, Sendable {
 
     public var startDate: Date { startedAt ?? createdAt }
 
+    /// Title for a task started without one (`mirador start` with no `--title` and no branch).
+    public static let untitled = "Untitled task"
+
+    /// A title nobody chose: empty, the CLI default, or made from the branch name. Syncs replace it with the PR or
+    /// ticket title; a title typed by hand is kept.
+    public var hasPlaceholderTitle: Bool {
+        let s = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty || s == Self.untitled { return true }
+        guard let branch else { return false }
+        return s == branch || s == LocalWork.title(from: branch)
+    }
+
     public var priority: Priority { Priority(rawValue: priorityOverride ?? linearPriority ?? 0) ?? .none }
 
     public mutating func noteStart(_ date: Date?) {
@@ -258,8 +281,15 @@ public struct TrackedTask: Codable, Identifiable, Hashable, Sendable {
     public mutating func setStatus(_ new: TaskStatus, source: String) {
         guard new != status else { return }
         status = new
+        snoozedUntil = nil
+        if !archived { archivedAt = nil }
         updatedAt = .now
         history.append(StatusChange(status: new, source: source))
+    }
+
+    public mutating func setArchived(_ value: Bool, at date: Date = .now) {
+        archived = value
+        if value { archivedAt = date }
     }
 
     /// Mine when I authored the PR, or when there is no PR author and it is not a review.
@@ -284,6 +314,10 @@ public struct TrackedTask: Codable, Identifiable, Hashable, Sendable {
     public var githubURL: URL? {
         if let prURL { return URL(string: prURL) }
         return prNumber.flatMap { URL(string: "https://github.com/strapi/strapi/pull/\($0)") }
+    }
+
+    public var issueURL: URL? {
+        issueNumber.flatMap { URL(string: "https://github.com/\(GitHubSync.repo)/issues/\($0)") }
     }
 }
 
@@ -342,6 +376,22 @@ public struct Ping: Codable, Hashable, Identifiable, Sendable {
         case .linearAssigned: "Assigned to you in Linear"
         case .ciFailed: "CI failing" + (prNumber.map { " · #\($0)" } ?? "")
         case .linearAuth: "Linear key not working"
+        }
+    }
+
+    /// Every word must match. A number (`28344` or `#28344`) matches that PR exactly, so `#283` does not pull in
+    /// #28344; other words match the title, headline, author or link, ignoring case.
+    public func matches(_ query: String) -> Bool {
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return true }
+        let text = [headline, title, url, actor ?? ""].joined(separator: " ").lowercased()
+        return words.allSatisfy { word in
+            let bare = word.hasPrefix("#") ? word.dropFirst() : word
+            if let number = Int(bare) {
+                if let prNumber { return prNumber == number }
+                return text.contains(String(bare))
+            }
+            return text.contains(word.hasPrefix("@") ? String(word.dropFirst()) : String(word))
         }
     }
 }
@@ -409,7 +459,7 @@ public struct AppSettings: Codable, Hashable, Sendable {
     }
 
     public func isMonorepo(_ path: String) -> Bool {
-        (path as NSString).standardizingPath == (repoPath as NSString).standardizingPath
+        Worktrees.samePath(path, repoPath)
     }
 
     public func port(for path: String) -> Int { isMonorepo(path) ? monorepoPort : worktreePort }

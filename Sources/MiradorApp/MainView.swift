@@ -3,12 +3,13 @@ import SwiftUI
 import MiradorCore
 
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
+    case focus = "Up next"
     case pings = "Pings"
     case needsMe = "Needs me"
     case active = "All active"
     case work = "My work"
     case reviews = "Reviews"
-    case done = "Done"
+    case history = "History"
     case environments = "Environments"
     case cleanup = "Cleanup"
 
@@ -16,12 +17,13 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
 
     var symbol: String {
         switch self {
+        case .focus: "scope"
         case .pings: "bell"
         case .needsMe: "exclamationmark.circle"
         case .active: "tray.full"
         case .work: "hammer"
         case .reviews: "eye"
-        case .done: "checkmark.circle"
+        case .history: "clock.arrow.circlepath"
         case .environments: "server.rack"
         case .cleanup: "trash"
         }
@@ -33,15 +35,15 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .active: !t.archived && !t.status.isFinished
         case .work: !t.archived && !t.status.isFinished && !t.kind.isReview
         case .reviews: !t.archived && !t.status.isFinished && t.kind.isReview
-        case .done: t.archived || t.status.isFinished
-        case .environments, .pings, .cleanup: false
+        case .history: t.archived || t.status.isFinished
+        case .focus, .environments, .pings, .cleanup: false
         }
     }
 }
 
 struct MainView: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("sidebarSection") private var sidebarRaw = SidebarItem.active.rawValue
+    @AppStorage("sidebarSection") private var sidebarRaw = SidebarItem.focus.rawValue
     private var sidebar: SidebarItem? {
         get { SidebarItem(rawValue: sidebarRaw) ?? .active }
         nonmutating set { sidebarRaw = (newValue ?? .active).rawValue }
@@ -59,6 +61,59 @@ struct MainView: View {
 
     var body: some View {
         @Bindable var model = model
+        Group {
+            if model.focusMode {
+                FocusModeView()
+            } else {
+                splitView
+            }
+        }        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if !model.focusMode {
+                if let error = model.errorMessage {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(Theme.destructive)
+                        .lineLimit(1)
+                        .frame(maxWidth: 260)
+                        .help(error)
+                }
+                SyncStatus()
+                Button { model.sync() } label: {
+                    if model.syncing { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.clockwise") }
+                }
+                .help("Sync GitHub, Linear and local branches (⌘R)")
+                PingsButton { sidebar = .pings }
+                Button { model.showAdd() } label: { Label("Add", systemImage: "plus") }
+                    .help("Add from a GitHub PR or Linear link (⌘N)")
+                }
+                Button { model.focusMode.toggle() } label: {
+                    Label(model.focusMode ? "Exit focus" : "Focus", systemImage: "scope")
+                }
+                .help(model.focusMode ? "Exit focus mode (⇧⌘F)" : "Focus mode: only the next task, no counts or pings (⇧⌘F)")
+            }
+        }
+        .navigationTitle("Mirador")
+        .hidingToolbarTitle()
+        .onAppear {
+            selection = UUID(uuidString: lastSelection)
+            if !onboardingDone { model.showingOnboarding = true }
+        }
+        .sheet(isPresented: $model.showingOnboarding) { OnboardingView() }
+        .onChange(of: selection) { _, id in lastSelection = id?.uuidString ?? "" }
+        .sheet(isPresented: $model.addingTask) {
+            AddTaskSheet { id in
+                sidebar = .active
+                selection = id
+            }
+        }
+        .sheet(isPresented: Binding(get: { model.linkingTask != nil }, set: { if !$0 { model.linkingTask = nil } })) {
+            if let task = model.tasks.first(where: { $0.id == model.linkingTask }) {
+                AddTaskSheet(target: task)
+            }
+        }
+    }
+
+    private var splitView: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
                 HStack(spacing: 7) {
@@ -71,7 +126,7 @@ struct MainView: View {
                 .padding(.bottom, 6)
                 List(selection: sidebarBinding) {
                     Section("Tasks") {
-                        ForEach([SidebarItem.needsMe, .active, .work, .reviews, .done]) { item in
+                        ForEach([SidebarItem.focus, .needsMe, .active, .work, .reviews, .history]) { item in
                             Label(item.rawValue, systemImage: item.symbol).badge(count(item)).tag(item)
                         }
                     }
@@ -86,6 +141,8 @@ struct MainView: View {
             .navigationSplitViewColumnWidth(min: 190, ideal: 210)
         } detail: {
             switch sidebar ?? .active {
+            case .focus:
+                FocusView()
             case .environments:
                 EnvironmentsView()
             case .pings:
@@ -115,45 +172,13 @@ struct MainView: View {
                 .searchable(text: $search, placement: .toolbar, prompt: "Search tasks")
             }
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                if let error = model.errorMessage {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(Theme.destructive)
-                        .lineLimit(1)
-                        .frame(maxWidth: 260)
-                        .help(error)
-                }
-                SyncStatus()
-                Button { model.sync() } label: {
-                    if model.syncing { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.clockwise") }
-                }
-                .help("Sync GitHub, Linear and local branches (⌘R)")
-                PingsButton { sidebar = .pings }
-                Button { model.showAdd() } label: { Label("Add", systemImage: "plus") }
-                    .help("Add from a GitHub PR or Linear link (⌘N)")
-            }
-        }
-        .navigationTitle("Mirador")
-        .hidingToolbarTitle()
-        .onAppear {
-            selection = UUID(uuidString: lastSelection)
-            if !onboardingDone { model.showingOnboarding = true }
-        }
-        .sheet(isPresented: $model.showingOnboarding) { OnboardingView() }
-        .onChange(of: selection) { _, id in lastSelection = id?.uuidString ?? "" }
-        .sheet(isPresented: $model.addingTask) {
-            AddTaskSheet { id in
-                sidebar = .active
-                selection = id
-            }
-        }
     }
 
     private func count(_ item: SidebarItem) -> Int {
         switch item {
-        case .done, .environments, .cleanup: 0
+        case .history, .environments, .cleanup: 0
         case .pings: model.unreadPings.count
+        case .focus: model.focusQueue.count
         default: model.tasks.filter(item.includes).count
         }
     }
@@ -190,6 +215,9 @@ struct MainView: View {
             if let qa, task.qa != qa { return false }
             return query.isEmpty || Self.searchText(of: task).contains(query)
         }
+        if item == .history && sort == .updated {
+            return shown.sorted { ($0.archivedAt ?? $0.updatedAt) > ($1.archivedAt ?? $1.updatedAt) }
+        }
         return shown.sorted(by: sort.areInIncreasingOrder)
     }
 
@@ -199,6 +227,8 @@ struct MainView: View {
         if let branch = task.branch { parts.append(branch) }
         if let key = task.linearKey { parts.append(key) }
         if let pr = task.prNumber { parts.append(String(pr)) }
+        if let issue = task.issueNumber { parts.append(String(issue)) }
+        if let title = task.issueTitle { parts.append(title) }
         if let author = task.prAuthor { parts.append(author) }
         return parts.joined(separator: " ").lowercased()
     }
@@ -213,24 +243,21 @@ struct SidebarFooter: View {
             if model.linearNeedsKey {
                 LinearKeyPrompt { openSettings() }
             }
-            if !model.running.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Running")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Theme.mutedForeground)
-                    ForEach(model.running, id: \.worktreePath) { env in
-                        HStack(spacing: 6) {
-                            EnvironmentBadge(state: model.state(of: env.worktreePath),
-                                             detail: (env.worktreePath as NSString).lastPathComponent)
-                            Spacer(minLength: 4)
-                            Muted(":\(String(model.port(for: env.worktreePath)))", size: 11)
-                        }
-                        .help("\(model.state(of: env.worktreePath).label) · \(env.worktreePath)")
-                    }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Environments")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.mutedForeground)
+                    .padding(.horizontal, 8)
+                if let repo = model.monorepo {
+                    EnvironmentQuickRow(path: repo.path, title: "Monorepo", subtitle: repo.branch ?? "detached")
+                        .padding(.leading, 8)
                 }
-                .padding(.horizontal, 8)
-                Divider().overlay(Theme.border)
+                if let wt = model.quickWorktree {
+                    EnvironmentQuickRow(path: wt.path, title: wt.name, subtitle: model.environmentTitle(for: wt.path))
+                        .padding(.leading, 8)
+                }
             }
+            Divider().overlay(Theme.border)
             AccountBlock { openSettings() }
         }
         .padding(12)
@@ -409,6 +436,7 @@ struct TaskRow: View {
                     Group {
                         if let pr = task.prNumber { Text("#\(String(pr))") }
                         if let key = task.linearKey { Text(key) }
+                        if let issue = task.issueNumber, task.prNumber == nil { Text("Issue #\(String(issue))") }
                     }
                     .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(Theme.mutedForeground)
@@ -444,20 +472,27 @@ struct TaskMenu: View {
         if task.qa != nil { Menu("QA") { QAMenu(task: task) } }
         if let url = task.githubURL { Button("Open PR") { model.open(url) } }
         if let url = task.linearURL { Button("Open Linear") { model.open(url) } }
+        if let url = task.issueURL { Button("Open issue") { model.open(url) } }
+        Button("Link a PR, issue or ticket…") { model.showLink(task.id) }
         if let wt = model.worktree(for: task) {
             Button("Reveal worktree") { model.reveal(wt.path) }
             Button("Quickstart environment") { model.startEnvironment(wt.path) }
         }
         Divider()
-        Button(task.archived ? "Unarchive" : "Archive") { model.mutate(task.id) { $0.archived.toggle() } }
+        Button(task.archived ? "Unarchive" : "Archive") { model.mutate(task.id) { $0.setArchived(!$0.archived) } }
         Button("Delete", role: .destructive) { model.delete(task.id) }
     }
 }
 
 struct PingsView: View {
     @Environment(AppModel.self) private var model
+    @State private var search = ""
+    @State private var confirmingDelete = false
 
     var body: some View {
+        let shown = model.pings.filter { $0.matches(search) }
+        let filtering = !search.trimmingCharacters(in: .whitespaces).isEmpty
+        let unreadShown = Set(shown.filter { !$0.read }.map(\.id))
         Group {
             if model.pings.isEmpty {
                 ContentUnavailableView("No pings yet", systemImage: "bell", description: Text("Review requests and mentions from GitHub and Linear show up here and as notifications."))
@@ -467,16 +502,28 @@ struct PingsView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Text("Pings").font(.system(size: 20, weight: .semibold))
+                            if filtering { Muted("\(shown.count) of \(model.pings.count)", size: 13) }
                             Spacer()
-                            Button("Mark all read") { model.markRead() }
-                                .shadButton(.outline)
-                                .disabled(model.unreadPings.isEmpty)
+                            Button(filtering ? "Mark \(unreadShown.count) read" : "Mark all read") {
+                                if filtering { model.markRead(unreadShown) } else { model.markRead() }
+                            }
+                            .shadButton(.outline)
+                            .disabled(unreadShown.isEmpty)
+                            if filtering {
+                                Button("Delete \(shown.count)") { confirmingDelete = true }
+                                    .shadButton(.destructive)
+                                    .disabled(shown.isEmpty)
+                            }
                         }
-                        Card(padding: 6) {
-                            VStack(spacing: 0) {
-                                ForEach(model.pings) { ping in
-                                    PingRow(ping: ping).padding(10)
-                                    if ping.id != model.pings.last?.id { Divider().overlay(Theme.border) }
+                        if shown.isEmpty {
+                            ContentUnavailableView.search(text: search)
+                        } else {
+                            Card(padding: 6) {
+                                VStack(spacing: 0) {
+                                    ForEach(shown) { ping in
+                                        PingRow(ping: ping).padding(10)
+                                        if ping.id != shown.last?.id { Divider().overlay(Theme.border) }
+                                    }
                                 }
                             }
                         }
@@ -488,6 +535,15 @@ struct PingsView: View {
             }
         }
         .background(Theme.background)
+        .searchable(text: $search, placement: .toolbar, prompt: "Filter pings: #PR, @user, keyword")
+        .confirmationDialog("Delete \(shown.count) ping\(shown.count == 1 ? "" : "s") matching “\(search)”?", isPresented: $confirmingDelete) {
+            Button("Delete", role: .destructive) {
+                model.deletePings(Set(shown.map(\.id)))
+                search = ""
+            }
+        } message: {
+            Text("They are removed from Mirador only; nothing changes on GitHub or Linear.")
+        }
     }
 }
 
@@ -638,21 +694,21 @@ struct PingsButton: View {
 
     var body: some View {
         let unread = model.unreadPings.count
+        // The count sits inside the label: toolbar items clip anything drawn past their bounds.
         Button { open.toggle() } label: {
-            Image(systemName: unread > 0 ? "bell.badge.fill" : "bell")
-                .symbolRenderingMode(unread > 0 ? .palette : .monochrome)
-                .foregroundStyle(unread > 0 ? Color.red : Theme.foreground, Theme.foreground)
-                .overlay(alignment: .topTrailing) {
-                    if unread > 0 {
-                        Text("\(min(unread, 99))")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 4)
-                            .frame(minWidth: 15, minHeight: 15)
-                            .background(Color.red, in: Capsule())
-                            .offset(x: 9, y: -7)
-                    }
+            HStack(spacing: 3) {
+                Image(systemName: unread > 0 ? "bell.fill" : "bell")
+                    .foregroundStyle(Theme.foreground)
+                if unread > 0 {
+                    Text(unread > 99 ? "99+" : "\(unread)")
+                        .font(.system(size: 10, weight: .bold).monospacedDigit())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .frame(minWidth: 16, minHeight: 16)
+                        .background(Color.red, in: Capsule())
+                        .fixedSize()
                 }
+            }
         }
         .help(unread > 0 ? "\(unread) unread ping\(unread == 1 ? "" : "s")" : "Pings")
         .popover(isPresented: $open, arrowEdge: .bottom) {

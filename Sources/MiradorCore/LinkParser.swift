@@ -1,7 +1,9 @@
 import Foundation
 
 public enum ParsedLink: Equatable, Sendable {
+    /// A PR link, or a bare `#123` (resolved as an issue when it is not a PR).
     case githubPR(Int)
+    case githubIssue(Int)
     case linear(String)
 
     public var prNumber: Int? {
@@ -11,12 +13,15 @@ public enum ParsedLink: Equatable, Sendable {
 }
 
 public enum LinkParser {
-    /// Accepts a GitHub PR URL, a Linear issue URL, `#123`, or `CMS-123`.
+    /// Accepts a GitHub PR or issue URL, a Linear issue URL, `#123`, or `CMS-123`.
     public static func parse(_ raw: String) -> ParsedLink? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count < 500 else { return nil }
         if let n = capture(#"github\.com/strapi/strapi/pull/(\d+)"#, in: text).flatMap(Int.init) {
             return .githubPR(n)
+        }
+        if let n = capture(#"github\.com/strapi/strapi/issues/(\d+)"#, in: text).flatMap(Int.init) {
+            return .githubIssue(n)
         }
         if text.contains("linear.app"), let key = LinearKey.find(in: text) {
             return .linear(key)
@@ -53,14 +58,27 @@ public struct LinkPreview: Sendable {
     public var startedAt: Date?
     public var linearPriority: Int?
     public var testSteps: String?
+    public var issueNumber: Int?
+    public var issueTitle: String?
+    public var issueState: String?
     public var subtitle: String
+
+    /// What the preview points at (a bare number may have turned out to be an issue).
+    public var taskLink: TaskLink {
+        if case .githubPR = link, prNumber == nil, let issueNumber { return .issue(issueNumber) }
+        return link.taskLink
+    }
 
     /// Fetches details from GitHub (`gh`) or Linear. Throws with a readable message.
     public static func resolve(_ link: ParsedLink, linearKey apiKey: String?) throws -> LinkPreview {
         switch link {
+        case .githubIssue(let n):
+            return try issuePreview(n, link: link)
         case .githubPR(let n):
             let fields = "number,title,url,state,isDraft,headRefName,author,isCrossRepository,reviewDecision,createdAt,body"
             let r = Shell.run("gh", ["pr", "view", String(n), "--repo", GitHubSync.repo, "--json", fields])
+            // Issues and PRs share numbers: `#123` that is no PR may be an issue.
+            if r.status != 0, let issue = try? issuePreview(n, link: link) { return issue }
             guard r.status == 0 else { throw LinearAPI.LinearError.http(r.stderr.isEmpty ? "PR #\(n) not found" : r.stderr) }
             struct PR: Decodable {
                 struct Author: Decodable { var login: String }
@@ -115,6 +133,35 @@ public struct LinkPreview: Sendable {
         }
     }
 
+    static func issuePreview(_ n: Int, link: ParsedLink) throws -> LinkPreview {
+        let r = Shell.run("gh", ["issue", "view", String(n), "--repo", GitHubSync.repo, "--json", "number,title,state,author,createdAt,labels"])
+        guard r.status == 0 else { throw LinearAPI.LinearError.http(r.stderr.isEmpty ? "Issue #\(n) not found" : r.stderr) }
+        struct Issue: Decodable {
+            struct Author: Decodable { var login: String }
+            struct Label: Decodable { var name: String }
+            var number: Int
+            var title: String
+            var state: String
+            var author: Author?
+            var createdAt: Date?
+            var labels: [Label]?
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let issue = try decoder.decode(Issue.self, from: Data(r.stdout.utf8))
+        let names = (issue.labels ?? []).map { $0.name.lowercased() }
+        let kind: TaskKind = names.contains { $0.contains("enhancement") || $0.contains("feature") } ? .feature : .fix
+        var preview = LinkPreview(
+            link: link, title: issue.title, kind: kind, status: .todo,
+            subtitle: "Issue #\(issue.number)" + (issue.author.map { " · @\($0.login)" } ?? "") + " · \(issue.state.lowercased())"
+        )
+        preview.issueNumber = issue.number
+        preview.issueTitle = issue.title
+        preview.issueState = issue.state.lowercased()
+        preview.startedAt = issue.createdAt
+        return preview
+    }
+
     init(link: ParsedLink, title: String, kind: TaskKind, status: TaskStatus, prNumber: Int? = nil, prURL: String? = nil,
          prAuthor: String? = nil, branch: String? = nil, linearKey: String? = nil, linearState: String? = nil, subtitle: String) {
         self.link = link
@@ -132,7 +179,10 @@ public struct LinkPreview: Sendable {
 
     /// Adds the task, or returns the index of the one already tracking this link.
     public func insert(into data: inout StoreData, worktrees: [Worktree]) -> Int {
-        if let i = data.tasks.firstIndex(where: { (prNumber != nil && $0.prNumber == prNumber) || (linearKey != nil && $0.linearKey == linearKey) }) {
+        let link = taskLink
+        if let i = data.tasks.firstIndex(where: {
+            $0.has(link) || (prNumber != nil && $0.prNumber == prNumber) || (linearKey != nil && $0.linearKey == linearKey)
+        }) {
             data.tasks[i].archived = false
             data.tasks[i].noteStart(startedAt)
             return i
@@ -147,6 +197,9 @@ public struct LinkPreview: Sendable {
         t.noteStart(startedAt)
         t.linearPriority = linearPriority
         t.testSteps = testSteps
+        t.issueNumber = issueNumber
+        t.issueTitle = issueTitle
+        t.issueState = issueState
         t.worktreePath = Worktrees.match(t, in: worktrees)?.path
         data.tasks.append(t)
         return data.tasks.count - 1

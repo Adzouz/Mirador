@@ -133,18 +133,20 @@ public enum GitHubSync {
       viewer { login }
       search(query: $q, type: ISSUE, first: 50) {
         nodes {
-          ... on PullRequest {
-            number title url state isDraft merged headRefName isCrossRepository createdAt body
-            author { login }
-            reviewDecision
-            commits(last: 1) { nodes { commit { committedDate } } }
-            reviews(last: 30) { nodes { author { login } state submittedAt } }
-            comments(last: 20) { nodes { author { login } createdAt } }
-            labels(first: 30) { nodes { name } }
-          }
+          ... on PullRequest { \(prFields) }
         }
       }
     }
+    """
+
+    static let prFields = """
+    number title url state isDraft merged headRefName isCrossRepository createdAt body
+    author { login }
+    reviewDecision
+    commits(last: 1) { nodes { commit { committedDate } } }
+    reviews(last: 30) { nodes { author { login } state submittedAt } }
+    comments(last: 20) { nodes { author { login } createdAt } }
+    labels(first: 30) { nodes { name } }
     """
 
     struct Response: Decodable {
@@ -180,9 +182,15 @@ public enum GitHubSync {
         public var authored: [PullRequest]
         public var requested: [PullRequest]
         public var reviewed: [PullRequest]
+        /// Tracked PRs none of the searches returned (a review request removed, a PR merged without me…).
+        public var tracked: [PullRequest] = []
+        /// Issues linked to open tasks.
+        public var issues: [Issue] = []
     }
 
-    public static func fetch() throws -> Snapshot {
+    /// `tracking`: PR numbers of tasks still open in Mirador; those the searches miss are looked up by number.
+    /// `issues`: issue numbers linked to open tasks, for their title and state.
+    public static func fetch(tracking: [Int] = [], issues: [Int] = []) throws -> Snapshot {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withFullDate]
         let month = f.string(from: Date().addingTimeInterval(-30 * 86400))
@@ -191,6 +199,9 @@ public enum GitHubSync {
         let r = try search("\(base) is:open review-requested:@me")
         let v = try search("\(base) reviewed-by:@me -author:@me updated:>=\(month)")
         var snap = Snapshot(me: a.me, authored: a.prs, requested: r.prs, reviewed: v.prs)
+        let found = Set((snap.authored + snap.requested + snap.reviewed).map(\.number))
+        snap.tracked = pullRequests(Array(Set(tracking).subtracting(found)))
+        snap.issues = Self.issues(issues)
         let open = Set((snap.authored + snap.requested + snap.reviewed).filter { $0.state == "OPEN" }.map(\.number))
         let rollups = fetchCI(Array(open))
         func fill(_ prs: inout [PullRequest]) { for i in prs.indices { prs[i].ciRollup = rollups[prs[i].number] } }
@@ -198,6 +209,49 @@ public enum GitHubSync {
         fill(&snap.requested)
         fill(&snap.reviewed)
         return snap
+    }
+
+    /// Values of an aliased GraphQL batch. `gh` exits non-zero when one alias fails (a number that is not a PR, or not
+    /// an issue), yet still prints the others: keep them instead of dropping the whole batch.
+    static func batch<T: Decodable>(_ stdout: String, as: T.Type, decoder: JSONDecoder = JSONDecoder()) -> [T] {
+        guard let env = try? decoder.decode(GraphQLEnvelope<RepositoryBatch<T>>.self, from: Data(stdout.utf8)),
+              let repo = env.data?.repository else { return [] }
+        return repo.values.compactMap { $0 }
+    }
+
+    struct RepositoryBatch<T: Decodable>: Decodable { var repository: [String: T?]? }
+
+    /// PRs by number, 20 per request. A failed batch just leaves those tasks as they were.
+    static func pullRequests(_ numbers: [Int]) -> [PullRequest] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var out: [PullRequest] = []
+        let sorted = numbers.sorted()
+        for start in stride(from: 0, to: sorted.count, by: 20) {
+            let fields = sorted[start..<min(start + 20, sorted.count)].map { "p\($0): pullRequest(number: \($0)) { \(prFields) }" }
+            let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields.joined(separator: "\n")) } }"
+            out += batch(Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"]).stdout, as: PullRequest.self, decoder: decoder)
+        }
+        return out
+    }
+
+    public struct Issue: Decodable, Sendable {
+        public var number: Int
+        public var title: String
+        /// OPEN or CLOSED.
+        public var state: String
+    }
+
+    /// Issues by number, 20 per request. A failed batch just leaves those tasks as they were.
+    static func issues(_ numbers: [Int]) -> [Issue] {
+        var out: [Issue] = []
+        let sorted = Array(Set(numbers)).sorted()
+        for start in stride(from: 0, to: sorted.count, by: 20) {
+            let fields = sorted[start..<min(start + 20, sorted.count)].map { "i\($0): issue(number: \($0)) { number title state }" }
+            let query = "query { repository(owner: \"strapi\", name: \"strapi\") { \(fields.joined(separator: "\n")) } }"
+            out += batch(Shell.run("gh", ["api", "graphql", "-f", "query=\(query)"]).stdout, as: Issue.self)
+        }
+        return out
     }
 
     /// CI rollups for open PRs, 10 per request. A failed batch just leaves those PRs without CI.
@@ -294,7 +348,9 @@ public enum GitHubSync {
         func upsert(_ pr: PullRequest, derived: TaskStatus?, reviewKind: Bool) {
             var index = data.tasks.firstIndex { $0.prNumber == pr.number }
             if index == nil {
-                index = data.tasks.firstIndex { $0.prNumber == nil && $0.branch == pr.headRefName && !$0.archived }
+                index = data.tasks.firstIndex {
+                    $0.prNumber == nil && $0.branch == pr.headRefName && !$0.archived && !$0.isUnlinked(.pr(pr.number))
+                }
             }
             if index == nil {
                 // Only open PRs become new tasks; history is not imported.
@@ -320,7 +376,10 @@ public enum GitHubSync {
             }
             t.prAuthor = pr.author?.login
             t.branch = t.branch ?? pr.headRefName
-            t.linearKey = t.linearKey ?? LinearKey.find(in: pr.headRefName) ?? LinearKey.find(in: pr.title)
+            if t.hasPlaceholderTitle, !pr.title.isEmpty { t.title = pr.title }
+            if t.linearKey == nil, let key = LinearKey.find(in: pr.headRefName) ?? LinearKey.find(in: pr.title), !t.isUnlinked(.linear(key)) {
+                t.linearKey = key
+            }
             if t.worktreePath.map({ !FileManager.default.fileExists(atPath: $0) }) ?? true {
                 t.worktreePath = Worktrees.match(t, in: worktrees)?.path
             }
@@ -343,6 +402,20 @@ public enum GitHubSync {
             if pr.author?.login == snap.me { continue }
             let derived = status(reviewing: pr, me: snap.me, requested: requestedNumbers.contains(pr.number))
             upsert(pr, derived: derived, reviewKind: true)
+        }
+        // Out of every search, so only an end state is reliable: the rest is kept as it was.
+        for pr in snap.tracked where pr.state != "OPEN" {
+            upsert(pr, derived: pr.merged ? .merged : .closed, reviewKind: pr.author?.login != snap.me)
+        }
+        for issue in snap.issues {
+            for i in data.tasks.indices where data.tasks[i].issueNumber == issue.number {
+                let state = issue.state.lowercased()
+                guard data.tasks[i].issueTitle != issue.title || data.tasks[i].issueState != state else { continue }
+                data.tasks[i].issueTitle = issue.title
+                data.tasks[i].issueState = state
+                if data.tasks[i].hasPlaceholderTitle, data.tasks[i].prNumber == nil { data.tasks[i].title = issue.title }
+                changed += 1
+            }
         }
         data.lastGitHubSync = .now
         data.githubLogin = snap.me

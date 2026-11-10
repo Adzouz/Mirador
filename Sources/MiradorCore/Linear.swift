@@ -212,6 +212,7 @@ public enum LinearAPI {
             for i in data.tasks.indices where data.tasks[i].linearKey == issue.identifier {
                 data.tasks[i].linearState = issue.state.name
                 data.tasks[i].linearPriority = issue.priority
+                if data.tasks[i].hasPlaceholderTitle, data.tasks[i].prNumber == nil { data.tasks[i].title = issue.title }
                 data.tasks[i].noteStart(issue.startedAt ?? issue.createdAt)
             }
         }
@@ -233,15 +234,19 @@ public enum LinearAPI {
     public static func apply(_ snap: Snapshot, to data: inout StoreData, worktrees: [Worktree]) -> [Ping] {
         let recent = Date().addingTimeInterval(-7 * 86400)
         for issue in snap.assigned {
+            let link = TaskLink.linear(issue.identifier)
             let index = data.tasks.firstIndex { $0.linearKey == issue.identifier }
-                ?? issue.prNumber.flatMap { pr in data.tasks.firstIndex { $0.prNumber == pr } }
+                ?? issue.prNumber.flatMap { pr in data.tasks.firstIndex { $0.prNumber == pr && $0.linearKey == nil && !$0.isUnlinked(link) } }
             if let i = index {
                 var t = data.tasks[i]
                 t.linearKey = issue.identifier
                 t.linearState = issue.state.name
-                t.prNumber = t.prNumber ?? issue.prNumber
+                if t.prNumber == nil, let pr = issue.prNumber, !t.isUnlinked(.pr(pr)), !data.tasks.contains(where: { $0.prNumber == pr }) {
+                    t.prNumber = pr
+                }
                 t.noteStart(issue.startedAt ?? issue.createdAt)
                 t.linearPriority = issue.priority
+                if t.hasPlaceholderTitle, t.prNumber == nil { t.title = issue.title }
                 if issue.state.type == "started", t.status == .todo { t.setStatus(.inProgress, source: "linear") }
                 if t.worktreePath == nil { t.worktreePath = Worktrees.match(t, in: worktrees)?.path }
                 data.tasks[i] = t
@@ -252,7 +257,8 @@ public enum LinearAPI {
             var t = TrackedTask(kind: issue.kind, title: issue.title, status: started ? .inProgress : .todo, source: "linear")
             t.linearKey = issue.identifier
             t.linearState = issue.state.name
-            t.prNumber = issue.prNumber
+            // Unlinked from its PR's task: the ticket stands on its own.
+            if let pr = issue.prNumber, !data.tasks.contains(where: { $0.prNumber == pr }) { t.prNumber = pr }
             t.noteStart(issue.startedAt ?? issue.createdAt)
             t.linearPriority = issue.priority
             t.branch = issue.branchName

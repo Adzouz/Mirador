@@ -55,6 +55,10 @@ struct MiradorApplication: App {
                 Button("Sync") { model.sync() }
                     .keyboardShortcut("r")
             }
+            CommandGroup(after: .sidebar) {
+                Button(model.focusMode ? "Exit Focus Mode" : "Focus Mode") { model.focusMode.toggle() }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+            }
         }
 
         Settings {
@@ -79,6 +83,17 @@ struct MenuBarLabel: View {
         let count = model.tasks.filter { !$0.archived && !$0.status.isFinished && $0.needsMe }.count
         HStack(spacing: 3) {
             Text("🔭")
+            if model.focusMode {
+                Image(systemName: "scope")
+            } else {
+                badges(count)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func badges(_ count: Int) -> some View {
+        HStack(spacing: 3) {
             if !model.running.isEmpty { Image(systemName: "bolt.fill") }
             if !model.unreadPings.isEmpty { Image(systemName: "bell.badge.fill") }
             if count > 0 { Text("\(count)") }

@@ -7,10 +7,11 @@ Agents: run `mirador guide` first.
 
   mirador start [--kind fix|feature|chore|review|community] [--title T] [--linear CMS-1] [--pr N] [--branch B]
       Create (or resume) the task for the current worktree and mark it in progress / reviewing.
-  mirador add <link>             Track a GitHub PR or Linear ticket (URL, #123 or CMS-123).
+  mirador add <link>             Track a GitHub PR, GitHub issue or Linear ticket (URL, #123 or CMS-123).
   mirador status <status> [ref]  Set a status (ref = PR number, CMS key, branch or path; default: current worktree).
   mirador note <text> [--ref R]  Add a one-line note.
-  mirador link [ref] [--pr N] [--linear CMS-1] [--title T] [--kind K]
+  mirador link [ref] [--pr N] [--issue N] [--linear CMS-1] [--unlink pr|issue|linear] [--title T] [--kind K]
+      Link a task to a PR, issue or ticket (one of each). A task already tracking it is merged into this one.
   mirador show [ref] · mirador list [--all] · mirador sync
   mirador worktree <ref> [--dir D]              Create a worktree (PR: gh pr checkout; ticket: new branch).
   mirador env start|stop|status [path] [--all]  Monorepo and one worktree run side by side.
@@ -79,6 +80,7 @@ func describe(_ t: TrackedTask) -> String {
     var parts = ["[\(t.status.label)]", t.kind.label, "—", t.title]
     if let pr = t.prNumber { parts.append("#\(pr)") }
     if let key = t.linearKey { parts.append(key) }
+    if let issue = t.issueNumber { parts.append("issue #\(issue)") }
     return parts.joined(separator: " ")
 }
 
@@ -109,11 +111,11 @@ case "start":
             t = data.tasks[index]
         } else {
             let kind = TaskKind(rawValue: args.options["kind"] ?? "") ?? .fix
-            t = TrackedTask(kind: kind, title: args.options["title"] ?? branch ?? "Untitled task", source: "claude")
+            t = TrackedTask(kind: kind, title: args.options["title"] ?? branch ?? TrackedTask.untitled, source: "claude")
         }
         apply(options: args.options, to: &t)
         t.branch = t.branch ?? branch
-        t.worktreePath = t.worktreePath ?? top
+        if let top, !Worktrees.samePath(top, data.settings.repoPath) { t.worktreePath = t.worktreePath ?? top }
         t.linearKey = t.linearKey ?? LinearKey.find(in: branch)
         t.archived = false
         t.noteStart(.now)
@@ -124,7 +126,7 @@ case "start":
     print(describe(task))
 
 case "add":
-    guard let raw = args.positional.first, let link = LinkParser.parse(raw) else { fail("usage: mirador add <GitHub PR or Linear link>") }
+    guard let raw = args.positional.first, let link = LinkParser.parse(raw) else { fail("usage: mirador add <GitHub PR, issue or Linear link>") }
     do {
         var preview = try LinkPreview.resolve(link, linearKey: LinearAPI.apiKey)
         if let kind = args.options["kind"].flatMap(TaskKind.init(rawValue:)) { preview.kind = kind }
@@ -147,11 +149,27 @@ case "status":
     print(describe(task))
 
 case "link":
-    let task: TrackedTask = store.update { data in
+    let (task, merged): (TrackedTask, [String]) = store.update { data in
         guard let i = resolve(args.positional.first, in: data) else { fail("no task found") }
-        apply(options: args.options, to: &data.tasks[i])
-        return data.tasks[i]
+        let id = data.tasks[i].id
+        var plain = args.options
+        for key in ["pr", "linear", "issue", "unlink"] { plain[key] = nil }
+        apply(options: plain, to: &data.tasks[i])
+        var merged: [String] = []
+        let parsers: [(String, (String) -> TaskLink?)] = [("pr", TaskLink.parsePR), ("linear", TaskLink.parseLinear), ("issue", TaskLink.parseIssue)]
+        for (option, parse) in parsers {
+            guard let value = args.options[option] else { continue }
+            guard let link = parse(value) else { fail("bad --\(option) \(value)") }
+            if let title = data.link(link, to: id) { merged.append(title) }
+        }
+        for type in (args.options["unlink"] ?? "").split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+            guard ["pr", "linear", "issue"].contains(type) else { fail("--unlink takes pr, issue or linear") }
+            let current = data.tasks.first { $0.id == id }?.links ?? []
+            for link in current where link.ref.hasPrefix("\(type):") { data.unlink(link, from: id) }
+        }
+        return (data.tasks.first { $0.id == id }!, merged)
     }
+    for title in merged { print("Merged \"\(title)\" into this task.") }
     print(describe(task))
 
 case "note":
@@ -173,6 +191,7 @@ case "show":
     print(describe(t))
     if let url = t.githubURL { print("GitHub:   \(url.absoluteString)") }
     if let url = t.linearURL { print("Linear:   \(url.absoluteString)") }
+    if let url = t.issueURL { print("Issue:    \(url.absoluteString)\(t.issueState.map { " (\($0))" } ?? "")") }
     if let wt = t.worktreePath { print("Worktree: \(wt)") }
     if let b = t.branch { print("Branch:   \(b)") }
     if !t.notes.isEmpty { print("Notes:\n\(t.notes)") }
@@ -185,11 +204,13 @@ case "list":
 
 case "sync":
     do {
-        let snap = try GitHubSync.fetch()
+        let open = store.load()
+        let snap = try GitHubSync.fetch(tracking: open.openPRNumbers, issues: open.openIssueNumbers)
         let worktrees = Worktrees.list(settings: store.load().settings)
         let activity = LocalWork.activity(in: worktrees)
         let (n, local) = store.update { data in
-            (GitHubSync.apply(snap, to: &data, worktrees: worktrees), LocalWork.apply(worktrees: worktrees, activity: activity, to: &data))
+            defer { Archive.apply(to: &data) }
+            return (GitHubSync.apply(snap, to: &data, worktrees: worktrees), LocalWork.apply(worktrees: worktrees, activity: activity, to: &data))
         }
         print("Synced GitHub: \(n) task(s) updated, \(local) new local branch task(s).")
     } catch {

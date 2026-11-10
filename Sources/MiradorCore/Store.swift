@@ -74,14 +74,14 @@ public final class Store: @unchecked Sendable {
 }
 
 public extension StoreData {
-    /// Finds a task by PR number, Linear key, branch, worktree path or UUID prefix.
+    /// Finds a task by PR or issue number, Linear key, branch, worktree path or UUID prefix.
     func find(_ ref: String) -> Int? {
         let r = ref.trimmingCharacters(in: .whitespaces)
         let number = Int(r.trimmingCharacters(in: CharacterSet(charactersIn: "#")))
         let key = LinearKey.find(in: r)
         let path = (r as NSString).standardizingPath
         return tasks.lastIndex { t in
-            if let number, t.prNumber == number { return true }
+            if let number, t.prNumber == number || t.issueNumber == number { return true }
             if let key, t.linearKey == key, number == nil { return true }
             if t.branch == r { return true }
             if let wt = t.worktreePath, wt == path { return true }

@@ -28,19 +28,26 @@ public enum Worktrees {
         let repo = (settings.repoPath as NSString).standardizingPath
         let result = Shell.run("git", ["-C", repo, "worktree", "list", "--porcelain"])
         var items = result.status == 0 ? parse(result.stdout) : []
-        for i in items.indices { items[i].isMain = items[i].path == repo }
-        let known = Set(items.map(\.path))
+        for i in items.indices { items[i].isMain = samePath(items[i].path, repo) }
+        let known = Set(items.map { resolved($0.path) })
         let folder = (settings.worktreesPath as NSString).standardizingPath
         let children = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
         for name in children.sorted() {
             let path = (folder as NSString).appendingPathComponent(name)
-            guard !known.contains(path),
+            guard !known.contains(resolved(path)),
                   FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(".git")) else { continue }
             let head = Shell.run("git", ["-C", path, "rev-parse", "HEAD"]).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             items.append(Worktree(path: path, branch: currentBranch(at: path), head: head, isMain: false))
         }
         return items
     }
+
+    /// Paths as the file system sees them: git prints real paths, Settings may hold a symlink.
+    public static func resolved(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).standardizingPath).resolvingSymlinksInPath().path
+    }
+
+    public static func samePath(_ a: String, _ b: String) -> Bool { resolved(a) == resolved(b) }
 
     static func parse(_ porcelain: String) -> [Worktree] {
         var items: [Worktree] = []
@@ -58,8 +65,18 @@ public enum Worktrees {
         return items
     }
 
-    /// Best worktree for a task: same branch first, then a `pr-<number>` folder.
-    public static func match(_ task: TrackedTask, in worktrees: [Worktree]) -> Worktree? {
+    /// The worktree a task runs in: its linked one, else the best match. Never the monorepo checkout: it is shared
+    /// by every task and switches branches, so a task gets its own worktree instead.
+    public static func resolve(_ task: TrackedTask, in worktrees: [Worktree]) -> Worktree? {
+        if let path = task.worktreePath, let wt = worktrees.first(where: { $0.path == path }) {
+            return wt.isMain ? match(task, in: worktrees) : wt
+        }
+        return match(task, in: worktrees)
+    }
+
+    /// Best worktree for a task (the monorepo excluded): same branch first, then a `pr-<number>` folder.
+    public static func match(_ task: TrackedTask, in all: [Worktree]) -> Worktree? {
+        let worktrees = all.filter { !$0.isMain }
         if let branch = task.branch, let wt = worktrees.first(where: { $0.branch == branch }) { return wt }
         if let pr = task.prNumber, let wt = worktrees.first(where: { $0.prNumberFromName == pr }) { return wt }
         if let key = task.linearKey {
@@ -126,7 +143,7 @@ public enum LocalWork {
             if exists {
                 if let i = data.tasks.firstIndex(where: { key != nil && $0.linearKey == key && $0.branch == nil }) {
                     data.tasks[i].branch = branch
-                    data.tasks[i].worktreePath = data.tasks[i].worktreePath ?? wt.path
+                    if !wt.isMain { data.tasks[i].worktreePath = data.tasks[i].worktreePath ?? wt.path }
                 }
                 continue
             }
@@ -134,7 +151,7 @@ public enum LocalWork {
             var t = TrackedTask(kind: kind, title: title(from: branch), status: .inProgress, source: "local")
             t.branch = branch
             t.linearKey = key
-            t.worktreePath = wt.path
+            t.worktreePath = wt.isMain ? nil : wt.path
             t.noteStart(activity[branch].flatMap { $0 == .distantPast ? nil : $0 })
             data.tasks.append(t)
             created += 1

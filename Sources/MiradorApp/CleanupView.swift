@@ -4,8 +4,17 @@ import MiradorCore
 /// Stale branches and worktrees. Nothing is removed without an explicit selection and a confirmation listing every name.
 struct CleanupView: View {
     @Environment(AppModel.self) private var model
-    @State private var report: Cleanup.Report?
+    /// Kept on the model so coming back to the tab shows the last scan at once.
+    private var report: Cleanup.Report? {
+        get { model.cleanupReport }
+        nonmutating set { model.cleanupReport = newValue }
+    }
     @State private var scanning = false
+    /// The local list is shown; fetch + GitHub PR states are still coming.
+    private var syncingRemote: Bool {
+        get { model.cleanupSyncingRemote }
+        nonmutating set { model.cleanupSyncingRemote = newValue }
+    }
     @State private var working = false
     @State private var branchFilter: Cleanup.BranchState? = nil
     @State private var selectedBranches: Set<String> = []
@@ -34,11 +43,20 @@ struct CleanupView: View {
                 } else if let result {
                     Label(result, systemImage: "info.circle").font(.system(size: 12)).foregroundStyle(Theme.mutedForeground)
                 }
+                if syncingRemote {
+                    Card(padding: 12) {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Syncing with remote…").font(.system(size: 12, weight: .semibold))
+                            Muted("Fetching, pruning and asking GitHub which PRs are merged or closed. Removing is available once it is done.", size: 12)
+                        }
+                    }
+                }
                 if let report {
                     worktreesCard(report)
                     branchesCard(report)
                 } else if scanning {
-                    Card { HStack { ProgressView().controlSize(.small); Muted("Fetching, pruning and asking GitHub about every branch…") } }
+                    Card { HStack { ProgressView().controlSize(.small); Muted("Reading local branches and worktrees…") } }
                 }
             }
             .padding(24)
@@ -46,7 +64,8 @@ struct CleanupView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Theme.background)
-        .onAppear { if report == nil { scan() } }
+        // Back on the tab while a scan is still syncing: let that one finish instead of starting a second fetch.
+        .onAppear { if !syncingRemote { scan() } }
         .confirmationDialog(branchDialogTitle, isPresented: $confirmBranches, titleVisibility: .visible) {
             Button("Delete \(selectedBranches.count) branch\(selectedBranches.count == 1 ? "" : "es")", role: .destructive, action: deleteBranches)
             Button("Cancel", role: .cancel) {}
@@ -68,15 +87,18 @@ struct CleanupView: View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Cleanup").font(.system(size: 20, weight: .semibold))
-                Muted(report.map { "Scanned \($0.scannedAt.formatted(.relative(presentation: .named))) · merged status comes from GitHub (squash merges included)" }
-                      ?? "Local branches and worktrees you may not need anymore.")
+                Muted(report.map { r in
+                    r.remoteChecked
+                        ? "Synced with GitHub \(r.scannedAt.formatted(.relative(presentation: .named))) · merged status comes from GitHub (squash merges included)"
+                        : "Local scan · PR states are being checked on GitHub"
+                } ?? "Local branches and worktrees you may not need anymore.")
             }
             Spacer()
             Button(action: scan) {
                 if scanning { ProgressView().controlSize(.small) } else { Label("Rescan", systemImage: "arrow.clockwise") }
             }
             .shadButton(.outline)
-            .disabled(scanning || working)
+            .disabled(scanning || syncingRemote || working)
         }
     }
 
@@ -90,11 +112,12 @@ struct CleanupView: View {
                     selectedWorktrees = Set(removable.filter { $0.branchState?.isStale == true && $0.dirtyFiles == 0 }.map(\.path))
                 }
                 .shadButton(.ghost)
+                .disabled(!report.remoteChecked)
                 Button { confirmWorktrees = true } label: {
                     Label("Remove \(selectedWorktrees.count)", systemImage: "trash")
                 }
                 .shadButton(.destructive)
-                .disabled(selectedWorktrees.isEmpty || working)
+                .disabled(selectedWorktrees.isEmpty || working || syncingRemote)
             }
             VStack(spacing: 0) {
                 ForEach(report.worktrees) { wt in
@@ -118,6 +141,7 @@ struct CleanupView: View {
                     selectedBranches = Set(visible.filter { $0.state.isStale && $0.canDelete }.map(\.name))
                 }
                 .shadButton(.ghost)
+                .disabled(!report.remoteChecked)
                 if !selectedBranches.isEmpty {
                     Button("Clear") { selectedBranches = [] }.shadButton(.ghost)
                 }
@@ -125,7 +149,7 @@ struct CleanupView: View {
                     Label("Delete \(selectedBranches.count)", systemImage: "trash")
                 }
                 .shadButton(.destructive)
-                .disabled(selectedBranches.isEmpty || working)
+                .disabled(selectedBranches.isEmpty || working || syncingRemote)
             }
             HStack(spacing: 6) {
                 FilterChip(title: "All", count: report.branches.count, on: branchFilter == nil) { branchFilter = nil }
@@ -168,21 +192,37 @@ struct CleanupView: View {
 
     private func scan() { scan(keepSkipped: false) }
 
+    /// Local pass first (instant list, last known PR states), then fetch + GitHub. A newer scan drops older results.
     private func scan(keepSkipped: Bool) {
         scanning = true
+        model.cleanupGeneration += 1
+        let generation = model.cleanupGeneration
+        let model = model
         let settings = model.settings
         let running = model.runningPaths
         Task.detached {
-            let r = Cleanup.scan(settings: settings, running: running)
+            let local = Cleanup.scanLocal(settings: settings, running: running)
             await MainActor.run {
-                report = r
+                guard generation == model.cleanupGeneration else { return }
+                show(local.carryingRemoteState(from: report), keepSkipped: keepSkipped)
                 scanning = false
-                if !keepSkipped { skipped = [:] }
-                let valid = Set(r.branches.filter(\.canDelete).map(\.name))
-                selectedBranches.formIntersection(valid)
-                selectedWorktrees.formIntersection(Set(r.worktrees.filter(\.canRemove).map(\.path)))
+                syncingRemote = true
+            }
+            let full = Cleanup.scan(settings: settings, running: running)
+            await MainActor.run {
+                guard generation == model.cleanupGeneration else { return }
+                model.cleanupReport = full
+                model.cleanupSyncingRemote = false
+                show(full, keepSkipped: keepSkipped)
             }
         }
+    }
+
+    private func show(_ r: Cleanup.Report, keepSkipped: Bool) {
+        report = r
+        if !keepSkipped { skipped = [:] }
+        selectedBranches.formIntersection(Set(r.branches.filter(\.canDelete).map(\.name)))
+        selectedWorktrees.formIntersection(Set(r.worktrees.filter(\.canRemove).map(\.path)))
     }
 
     private func deleteBranches() {
@@ -342,7 +382,7 @@ struct WorktreeCleanupRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(info.name).font(.system(size: 13, weight: .medium))
-                    Text(info.branch ?? "detached").font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.mutedForeground).lineLimit(1)
+                    Text(info.branch ?? "detached HEAD").font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.mutedForeground).lineLimit(1)
                 }
                 HStack(spacing: 6) {
                     if let state = info.branchState { Badge(text: state.label, variant: .outline, color: state.color) }

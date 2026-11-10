@@ -27,6 +27,16 @@ and you get one place to answer "what am I working on, what is waiting on me, an
   - your PRs: draft → waiting for review → changes requested → addressing → approved → merged
   - your reviews: to review → reviewing → waiting on author → re-review → approved → merged
   - [docs/STATUSES.md](docs/STATUSES.md) explains every rule
+- **Focus mode** (⇧⌘F) — one task on screen, the one that needs you most: red CI and requested changes on your PRs,
+  then re-reviews, approved PRs to land, work in progress, new review requests and to-dos (urgent first, then
+  priority, then longest wait). No counts, no pings, no notifications. When the task moves on (GitHub, an agent, or
+  you), the next one takes its place; a newly arrived task never interrupts the current one. **Skip for now** puts a
+  task on a quiet skipped stack you can pick from later. The **Up next** list shows the whole queue outside focus mode,
+  with snoozing until tomorrow or next week.
+- **Links** — link any task to a PR, a GitHub issue and a Linear ticket (paste a link from the task's details or
+  `mirador link`). Linking something another task tracks merges the two; removing a link keeps it off.
+- **Auto-archive + History** — merged or closed PRs, and PR-less tickets done or canceled in Linear (or closed GitHub
+  issues), are archived on the next sync. **History** lists everything archived, newest first; unarchive keeps a task out until its status changes.
 - **Sync** — GitHub every minute through your `gh` login (reviews, comments, commits, CI checks, `qa-done` /
   `qa-skipped` labels, "How to test it?" from the PR description); Linear optionally (assigned and started tickets,
   priorities, mentions).
@@ -112,6 +122,7 @@ swift build && swift test
 ```
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit
+- [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) — why Mirador exists, product principles, feature map, current state
 - [AGENTS.md](AGENTS.md) — conventions and gotchas, for humans and AI agents working on this codebase
 - [CONTRIBUTING.md](CONTRIBUTING.md) · [docs/RELEASING.md](docs/RELEASING.md)
 

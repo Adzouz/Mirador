@@ -11,10 +11,10 @@ Without one, the task is found from the current directory (its worktree, then it
 | Command | What it does |
 | --- | --- |
 | `mirador start [--kind K] [--title T] [--linear KEY] [--pr N] [--branch B]` | Create or resume the task for the current worktree and mark it In progress (Reviewing for reviews). Kinds: `fix`, `feature`, `chore`, `review`, `community`. |
-| `mirador add <link>` | Track a GitHub PR or Linear ticket (URL, `#123` or `CMS-123`). |
+| `mirador add <link>` | Track a GitHub PR, GitHub issue or Linear ticket (URL, `#123` or `CMS-123`; a bare number that is not a PR is looked up as an issue). |
 | `mirador status <status> [ref]` | Set a status. Meant for the steps GitHub cannot see: `in-progress`, `reviewing`, `done-locally`, `addressing`, `taken-over`, `blocked`, `released`. |
 | `mirador note <text> [--ref R]` | Append a one-line note. |
-| `mirador link [ref] [--pr N] [--linear KEY] [--title T] [--kind K]` | Attach a PR / ticket or change the kind or title. |
+| `mirador link [ref] [--pr N] [--issue N] [--linear KEY] [--unlink pr\|issue\|linear] [--title T] [--kind K]` | Link a PR, GitHub issue or Linear ticket (one of each per task; a new one replaces the old), remove one, or change the kind or title. A task that already tracked the link is merged into this one. Removed links stay removed: the syncs do not attach them again. |
 | `mirador show [ref]` | Task details with GitHub, Linear and worktree links. |
 | `mirador list [--all]` | Active tasks (`--all` includes finished and archived). |
 | `mirador sync` | Pull GitHub and local branches now (the app does it every minute). |
