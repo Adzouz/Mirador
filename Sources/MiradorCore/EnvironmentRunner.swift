@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum EnvironmentState: Equatable, Sendable {
@@ -23,7 +24,7 @@ public enum EnvironmentRunner {
     /// Written by yarn (node-modules linker) only once an install completes, unlike node_modules itself.
     static let installedMarker = "node_modules/.yarn-state.yml"
 
-    public enum StartupPhase: Sendable {
+    public enum StartupPhase: String, Sendable {
         case installing, building, starting
 
         public var label: String {
@@ -35,12 +36,123 @@ public enum EnvironmentRunner {
         }
     }
 
-    /// What a starting environment is busy with, read from the checkout itself.
-    public static func startupPhase(of path: String) -> StartupPhase {
+    /// What a starting environment is busy with: what its start script last wrote, else read from the checkout
+    /// (environments started by an older version).
+    public static func startupPhase(of path: String, store: Store) -> StartupPhase {
+        if let raw = try? String(contentsOf: stateURL(for: path, "phase", store: store), encoding: .utf8),
+           let phase = StartupPhase(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return phase
+        }
         let fm = FileManager.default
         if !fm.fileExists(atPath: (path as NSString).appendingPathComponent(installedMarker)) { return .installing }
         if !fm.fileExists(atPath: (path as NSString).appendingPathComponent(builtMarker)) { return .building }
         return .starting
+    }
+
+    // MARK: Preparation
+
+    /// What runs before `yarn develop`.
+    public struct Preparation: Equatable, Sendable {
+        public enum Build: Equatable, Sendable {
+            case none, full
+            /// Project folders, as `nx run-many --projects` takes them.
+            case projects([String])
+        }
+
+        public var install = false
+        public var build = Build.none
+    }
+
+    /// Root files every package build reads.
+    static let sharedBuildInputs: Set<String> = ["package.json", "yarn.lock", ".yarnrc.yml", "nx.json", "rollup.utils.mjs", ".nxignore"]
+
+    /// Installs and builds what is missing, or what changed since the commit of the last build Mirador ran. `yarn watch`
+    /// never builds on start, so commits pulled while an environment was stopped would otherwise run on old `dist` folders.
+    static func preparation(installed: Bool, built: Bool, lastBuilt: String?, head: String?, changes: [String]?) -> Preparation {
+        var prep = Preparation(install: !installed, build: built ? .none : .full)
+        guard let lastBuilt, let head, lastBuilt != head else { return prep }
+        // The last build's commit is gone (rewritten, then pruned): nothing tells what changed.
+        guard let changes else { return Preparation(install: true, build: .full) }
+        if changes.contains(where: isDependencyFile) { prep.install = true }
+        if prep.build == .none { prep.build = buildScope(for: changes) }
+        return prep
+    }
+
+    static func isDependencyFile(_ path: String) -> Bool {
+        (path as NSString).lastPathComponent == "package.json" || path == "yarn.lock" || path == ".yarnrc.yml" || path.hasPrefix(".yarn/")
+    }
+
+    /// The packages to rebuild, like `yarn watch` does on a change: the `packages/*` and `packages/*/*` folders holding
+    /// changed files (nx skips folders that are not projects). A change to the shared build setup rebuilds everything.
+    static func buildScope(for changes: [String]) -> Preparation.Build {
+        if changes.contains(where: { sharedBuildInputs.contains($0) || $0.hasPrefix(".yarn/") }) { return .full }
+        var folders = Set<String>()
+        for path in changes {
+            let parts = path.split(separator: "/")
+            guard parts.count >= 3, parts[0] == "packages" else { continue }
+            for depth in 2...min(3, parts.count - 1) { folders.insert(parts.prefix(depth).joined(separator: "/")) }
+        }
+        return folders.isEmpty ? .none : .projects(folders.sorted())
+    }
+
+    /// Reads the checkout: install / build markers, HEAD, and what changed since the last recorded build.
+    static func preparation(for path: String, store: Store) -> (Preparation, head: String?) {
+        let fm = FileManager.default
+        let installed = fm.fileExists(atPath: (path as NSString).appendingPathComponent(installedMarker))
+        let built = fm.fileExists(atPath: (path as NSString).appendingPathComponent(builtMarker))
+        let head = BranchUpdate.commit("HEAD", in: path)
+        let lastBuilt = (try? String(contentsOf: stateURL(for: path, "built", store: store), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var changes: [String]?
+        if let lastBuilt, let head, lastBuilt != head {
+            let diff = Shell.git(["diff", "--name-only", "--no-renames", "-z", lastBuilt, head], in: path)
+            if diff.status == 0 { changes = diff.stdout.split(separator: "\0").map(String.init) }
+        }
+        let prep = preparation(installed: installed, built: built, lastBuilt: lastBuilt, head: head, changes: changes)
+        return (prep, head)
+    }
+
+    /// Records the commit the current build was made from, when Mirador has none yet (started by an older version, or
+    /// never started): moving HEAD (an update) must leave the next start something to compare with.
+    public static func recordBuildIfUnknown(of path: String, at commit: String, store: Store) {
+        let url = stateURL(for: path, "built", store: store)
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? commit.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Mirador's state for a checkout (`phase`: what its start is doing; `built`: the commit of its last build), kept out
+    /// of the checkout and keyed by its real path.
+    static func stateURL(for path: String, _ kind: String, store: Store) -> URL {
+        let resolved = Worktrees.resolved(path)
+        let digest = SHA256.hash(data: Data(resolved.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+        return store.directory.appendingPathComponent("environments", isDirectory: true)
+            .appendingPathComponent("\((resolved as NSString).lastPathComponent)-\(digest).\(kind)")
+    }
+
+    /// Install, build, record the build, then `yarn develop`. Each step reports its phase in `phase`.
+    static func developCommand(_ prep: Preparation, head: String?, appDirectory: String, phase: String, built: String) -> String {
+        var steps: [String] = []
+        if prep.install { steps += ["printf installing >| \(quote(phase))", "yarn install"] }
+        switch prep.build {
+        case .none: break
+        case .full: steps += ["printf building >| \(quote(phase))", "yarn build"]
+        case .projects(let folders):
+            steps += ["printf building >| \(quote(phase))",
+                      "yarn nx run-many --targets build:code,build:types --nx-ignore-cycles --projects \(quote(folders.joined(separator: ",")))"]
+        }
+        if let head { steps.append("printf %s \(quote(head)) >| \(quote(built))") }
+        steps += ["printf starting >| \(quote(phase))", "cd \(quote(appDirectory))", "exec yarn develop --watch-admin"]
+        return steps.joined(separator: " && ")
+    }
+
+    /// `yarn watch` only rebuilds on changes: it waits until install and build are done.
+    static func watchCommand(phase: String) -> String {
+        "until /usr/bin/grep -qx starting \(quote(phase)) 2>/dev/null; do sleep 3; done; exec yarn watch"
+    }
+
+    static func quote(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     public static var logDirectory: URL {
@@ -65,24 +177,30 @@ public enum EnvironmentRunner {
     }
 
     public static func start(worktreePath: String, store: Store) throws {
-        let appDirectory = store.load().settings.appDirectory
+        let settings = store.load().settings
+        let appDirectory = settings.appDirectory
         let appPath = (worktreePath as NSString).appendingPathComponent(appDirectory)
         guard FileManager.default.fileExists(atPath: appPath) else { throw RunError.missingApp(appDirectory, worktreePath) }
 
-        let settings = store.load().settings
         let port = settings.port(for: worktreePath)
         stop(slotOf: worktreePath, store: store)
         killPortListeners(port: port)
 
-        // A fresh worktree has no build output yet: build once before develop, and let watch wait for it.
-        let built = "test -e \(builtMarker)"
+        let (prep, head) = preparation(for: worktreePath, store: store)
+        let phase = stateURL(for: worktreePath, "phase", store: store)
+        let built = stateURL(for: worktreePath, "built", store: store)
+        try? FileManager.default.createDirectory(at: phase.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Written before spawning: a phase file left by the previous run must not release `yarn watch` early.
+        let first: StartupPhase = prep.install ? .installing : prep.build == .none ? .starting : .building
+        try? first.rawValue.write(to: phase, atomically: true, encoding: .utf8)
+
         let watch = try spawn(
-            "until \(built); do sleep 3; done; exec yarn watch",
+            watchCommand(phase: phase.path),
             cwd: worktreePath,
             log: logURL(for: worktreePath, process: "watch")
         )
         let develop = try spawn(
-            "(test -f \(installedMarker) || yarn install) && (\(built) || yarn build) && cd '\(appDirectory)' && exec yarn develop --watch-admin",
+            developCommand(prep, head: head, appDirectory: appDirectory, phase: phase.path, built: built.path),
             cwd: worktreePath,
             log: logURL(for: worktreePath, process: "develop"),
             extraEnv: ["PORT": String(port), "BROWSER": "none"]

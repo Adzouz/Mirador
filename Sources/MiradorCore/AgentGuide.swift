@@ -54,7 +54,7 @@ public enum AgentGuide {
     | Track a PR, issue or ticket | `mirador add <GitHub PR, GitHub issue or Linear URL>` |
     | Link the current task to a PR, issue or ticket | `mirador link [ref] --pr <n> \\| --issue <n> \\| --linear CMS-123` |
     | Create its worktree (`gh pr checkout` for PRs) | `mirador worktree <PR number or CMS key>` |
-    | Start it (installs + builds on first run) | `mirador env start <path>` |
+    | Start it (installs and builds what is missing or changed since its last start) | `mirador env start <path>` |
     | Create the super admin from Settings on a fresh app | `mirador admin <path>` |
     | What runs where | `mirador env status` |
 

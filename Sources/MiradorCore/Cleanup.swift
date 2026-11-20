@@ -86,10 +86,8 @@ public enum Cleanup {
         }
     }
 
-    static let git = "/usr/bin/git"
-
     static func run(_ args: [String], in dir: String) -> Shell.Result {
-        Shell.run(git, ["-C", dir] + args)
+        Shell.git(args, in: dir)
     }
 
     public static func isProtectedName(_ name: String) -> Bool {

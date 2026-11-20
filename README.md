@@ -44,7 +44,9 @@ and you get one place to answer "what am I working on, what is waiting on me, an
   red on your PR, or when your Linear key stops working.
 - **Local testing in one click** — create a git worktree for any PR (forks included), then **Quickstart** runs
   `yarn watch` + `yarn develop --watch-admin`. The monorepo and one worktree run side by side on their own ports, so you
-  can compare before / after. First start installs and builds, with progress. Optionally creates your super admin.
+  can compare before / after. The first start installs and builds, with progress; later starts rebuild only the
+  packages that changed. **Update branch** pulls a worktree's new commits (a force-pushed PR too, when nothing local
+  would be lost) and restarts it. Optionally creates your super admin.
 - **Cleanup** — find local branches and worktrees whose PR is merged or closed (squash merges included) and delete
   them in bulk, with confirmation and safety rules.
 - **For AI agents** — a `mirador` CLI and a Claude Code skill so agents update tasks, create worktrees and start
