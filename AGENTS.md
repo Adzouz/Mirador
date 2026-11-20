@@ -64,7 +64,7 @@ swift test                  # must stay green; add a test for every rule you add
   components in `Theme.swift`. Reuse `Card`, `Badge`, `ShadButtonStyle`, `StatusBadge` instead of system styles.
 - **Strapi specifics live in one place each:** repo name (`GitHubSync.repo`), expected-red CI checks
   (`CIStatus.expectedRed`), bot logins (`GitHubSync.bots`), PR template headings (`TestSteps.headings`), build markers
-  (`EnvironmentRunner`).
+  and shared build inputs (`EnvironmentRunner`).
 - Comments: only where the code cannot say it (a non-obvious constraint or a GitHub / Strapi quirk).
 - **Verify before claiming.** Run `swift test`; for UI, install and screenshot (see PROJECT_CONTEXT.md). Say which
   clicks you could not try. Never commit, push or open PRs unless the maintainer asks.
@@ -96,3 +96,17 @@ swift test                  # must stay green; add a test for every rule you add
   the others: decode stdout anyway (`GitHubSync.batch`), never gate on the exit status.
 - Every commit on develop is "associated" with the merged PR that brought it. A detached worktree belongs to a PR only
   when HEAD is that PR's `headRefOid` (`Cleanup.pullRequest(at:among:)`).
+- `yarn watch` (`nx watch`) never builds on start, so commits pulled while an environment is stopped would run on old
+  `dist` folders. Starts rebuild what changed since the commit recorded at Mirador's last build
+  (`EnvironmentRunner.preparation`), per project folder: a full `yarn build` is slow because nx also rebuilds every
+  dependent package.
+- `nx run-many --projects` (nx 20) takes project folders too and skips folders that are not projects, so targeted
+  rebuilds pass `packages/x` and `packages/x/y` without knowing package names.
+- A fork PR checked out by `gh pr checkout` follows a URL (or `refs/pull/<n>/head`): there is no remote-tracking ref,
+  so nothing proves a force-push only dropped the author's commits, and Update branch asks first.
+- `zsh -c` reads `~/.zshenv`, where Volta / nvm put the real `yarn` first in PATH: tests running generated scripts with
+  a fake `yarn` use `zsh -f`.
+- Worktrees get removed behind Mirador's back (a terminal, review tooling). Tell "removed" by its `.git` being gone
+  (`Worktrees.isGone`), never by absence from `git worktree list`, which a failing git call also gives.
+- Recorded process group ids outlive their processes (reboot, time) and get reused by unrelated ones: anything Mirador
+  kills on its own checks the group leader's start time first (`EnvironmentRunner.isOurs`).

@@ -380,7 +380,7 @@ public enum GitHubSync {
             if t.linearKey == nil, let key = LinearKey.find(in: pr.headRefName) ?? LinearKey.find(in: pr.title), !t.isUnlinked(.linear(key)) {
                 t.linearKey = key
             }
-            if t.worktreePath.map({ !FileManager.default.fileExists(atPath: $0) }) ?? true {
+            if t.worktreePath.map(Worktrees.isGone) ?? true {
                 t.worktreePath = Worktrees.match(t, in: worktrees)?.path
             }
             if let derived, derived != t.lastGitHubStatus {

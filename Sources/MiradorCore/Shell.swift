@@ -23,6 +23,12 @@ public enum Shell {
         return env
     }
 
+    /// Git in `dir`, through /usr/bin/git: shell wrappers some developers use rewrite `git` output.
+    @discardableResult
+    public static func git(_ args: [String], in dir: String) -> Result {
+        run("/usr/bin/git", ["-C", dir] + args)
+    }
+
     @discardableResult
     public static func run(_ executable: String, _ args: [String], cwd: String? = nil) -> Result {
         let process = Process()

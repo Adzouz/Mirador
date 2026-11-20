@@ -340,6 +340,8 @@ final class AppModel {
         let store = store
         let generation = worktreesGeneration
         Task.detached {
+            // Removed while the app was closed: unlinked tasks get matched again below.
+            EnvironmentRunner.forgetRemovedCheckouts(store: store)
             let worktrees = Worktrees.list(settings: store.load().settings)
             let activity = LocalWork.activity(in: worktrees)
             var pings: [Ping] = []
@@ -502,14 +504,46 @@ final class AppModel {
     func forgetWorktrees(_ paths: [String]) {
         guard !paths.isEmpty else { return }
         let removed = Set(paths)
-        store.update { data in
-            for i in data.tasks.indices where data.tasks[i].worktreePath.map(removed.contains) == true {
-                data.tasks[i].worktreePath = nil
-            }
-        }
+        store.update { $0.forgetCheckouts(removed) }
+        for path in paths { EnvironmentRunner.forgetState(of: path, store: store) }
+        if removed.contains(lastWorktreePath) { lastWorktreePath = "" }
         reload()
         worktreesGeneration += 1
         refreshWorktrees()
+    }
+
+    private var forgettingCheckouts = false
+    /// Modification dates of the worktrees folder and of git's list of worktrees: a change means a worktree was added or
+    /// removed outside Mirador.
+    private var worktreeFolderDates: [Date?]?
+
+    /// Runs with the environment poll, so a worktree added or removed from a terminal or another tool shows within
+    /// seconds instead of at the next sync. File dates and `.git` checks only: no git on the main actor.
+    private func followCheckouts() {
+        let folders = [settings.worktreesPath, (settings.repoPath as NSString).appendingPathComponent(".git/worktrees")]
+        let dates = folders.map { (try? FileManager.default.attributesOfItem(atPath: ($0 as NSString).standardizingPath))?[.modificationDate] as? Date }
+        if dates != worktreeFolderDates {
+            if worktreeFolderDates != nil { refreshWorktrees() }
+            worktreeFolderDates = dates
+        }
+
+        guard !forgettingCheckouts else { return }
+        let known = Set(worktrees.map(\.path) + running.map(\.worktreePath) + tasks.compactMap(\.worktreePath))
+        let gone = known.filter(Worktrees.isGone)
+        guard !gone.isEmpty else { return }
+        forgettingCheckouts = true
+        worktrees.removeAll { gone.contains($0.path) }
+        if gone.contains(lastWorktreePath) { lastWorktreePath = "" }
+        worktreesGeneration += 1
+        let store = store
+        Task.detached {
+            EnvironmentRunner.forgetRemovedCheckouts(store: store)
+            await MainActor.run {
+                self.forgettingCheckouts = false
+                self.reload()
+                self.refreshWorktrees()
+            }
+        }
     }
 
     func createWorktree(for task: TrackedTask) {
@@ -572,7 +606,7 @@ final class AppModel {
         for env in running where runningStates[env.worktreePath] == .starting {
             let elapsed = Int(Date().timeIntervalSince(env.startedAt))
             let time = elapsed >= 60 ? "\(elapsed / 60)m \(elapsed % 60)s" : "\(elapsed)s"
-            details[env.worktreePath] = "\(EnvironmentRunner.startupPhase(of: env.worktreePath).label) · \(time)"
+            details[env.worktreePath] = "\(EnvironmentRunner.startupPhase(of: env.worktreePath, store: store).label) · \(time)"
         }
         if details != startDetails { startDetails = details }
     }
@@ -591,6 +625,7 @@ final class AppModel {
     }
 
     private func pollEnvironment() {
+        followCheckouts()
         guard busyEnvironment == nil else { return }
         var states: [String: EnvironmentState] = [:]
         for env in running { states[env.worktreePath] = EnvironmentRunner.state(of: env.worktreePath, store: store) }
@@ -691,6 +726,96 @@ final class AppModel {
                 self.pollEnvironment()
             }
         }
+    }
+
+    // MARK: Branch updates
+
+    /// Checkouts whose branch is being updated.
+    var updatingBranch: Set<String> = []
+    /// What the last update of a checkout did, shown next to its button for a few seconds.
+    var branchNotes: [String: BranchNote] = [:]
+
+    struct BranchNote: Equatable {
+        let id = UUID()
+        var text: String
+        var isError = false
+    }
+
+    /// Pulls the latest commits of the checkout's branch (or its PR), then restarts its environment if it runs. The
+    /// start rebuilds what the pull changed.
+    func updateBranch(_ path: String, replacingLocal: Bool = false) {
+        guard !updatingBranch.contains(path) else { return }
+        updatingBranch.insert(path)
+        branchNotes[path] = nil
+        // Only used for a detached checkout, which has no branch to follow.
+        let pr = worktrees.first { $0.path == path }.flatMap { primaryTask(for: $0)?.prNumber ?? $0.prNumberFromName }
+        let store = store
+        Task.detached {
+            let outcome = BranchUpdate.run(at: path, prNumber: pr, replacingLocal: replacingLocal)
+            if case .updated(let from, _, _) = outcome {
+                EnvironmentRunner.recordBuildIfUnknown(of: path, at: from, store: store)
+            }
+            await MainActor.run { self.finishUpdate(path, outcome) }
+        }
+    }
+
+    private func finishUpdate(_ path: String, _ outcome: BranchUpdate.Outcome) {
+        updatingBranch.remove(path)
+        switch outcome {
+        case .upToDate:
+            showNote("Already up to date", for: path)
+        case .updated:
+            refreshWorktrees()
+            if running.contains(where: { $0.worktreePath == path }) {
+                showNote("Updated, restarting", for: path)
+                startEnvironment(path)
+            } else {
+                showNote("Updated", for: path)
+            }
+        case .diverged(let divergence):
+            Task { @MainActor in
+                if self.confirmReplace(divergence, at: path) { self.updateBranch(path, replacingLocal: true) }
+            }
+        case .failed(let message):
+            showNote(message, for: path, isError: true)
+        }
+    }
+
+    private func showNote(_ text: String, for path: String, isError: Bool = false) {
+        let note = BranchNote(text: text, isError: isError)
+        branchNotes[path] = note
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(isError ? 15 : 5))
+            if self.branchNotes[path] == note { self.branchNotes[path] = nil }
+        }
+    }
+
+    /// The new version lacks commits the checkout has: a force-push of the PR (fine to follow) or local commits.
+    private func confirmReplace(_ divergence: BranchUpdate.Divergence, at path: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let name = (path as NSString).lastPathComponent
+        let source = divergence.source.label
+        let commits = divergence.commits == 1 ? "1 commit" : "\(divergence.commits) commits"
+        let alert = NSAlert()
+        if divergence.mine == 0 {
+            alert.messageText = "\(source) was rewritten"
+            alert.informativeText = "\(name) has \(commits) that \(source) no longer has, none of them yours. "
+                + "Update to the new version? Uncommitted changes are kept."
+            alert.addButton(withTitle: "Update")
+            alert.addButton(withTitle: "Cancel")
+        } else {
+            alert.alertStyle = .warning
+            let yours = divergence.mine.map { $0 == divergence.commits ? " They are yours." : " \($0) of them are yours." } ?? ""
+            alert.messageText = "Drop local commits from \(name)?"
+            alert.informativeText = "\(name) has \(commits) that \(source) does not.\(yours) Updating drops them from the "
+                + "branch (git reflog can still bring them back). Uncommitted changes are kept."
+            let drop = alert.addButton(withTitle: "Drop and update")
+            drop.hasDestructiveAction = true
+            // Return must not drop commits.
+            drop.keyEquivalent = ""
+            alert.addButton(withTitle: "Cancel").keyEquivalent = "\r"
+        }
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     // MARK: Opening things

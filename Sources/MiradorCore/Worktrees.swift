@@ -42,12 +42,29 @@ public enum Worktrees {
         return items
     }
 
-    /// Paths as the file system sees them: git prints real paths, Settings may hold a symlink.
+    /// Paths as the file system sees them: git prints real paths, Settings may hold a symlink. A path that no longer
+    /// exists resolves through its deepest existing folder, so it keeps the form it had before it was removed.
     public static func resolved(_ path: String) -> String {
-        URL(fileURLWithPath: (path as NSString).standardizingPath).resolvingSymlinksInPath().path
+        let standard = (path as NSString).standardizingPath
+        var existing = standard
+        var missing: [String] = []
+        while !FileManager.default.fileExists(atPath: existing) {
+            let parent = (existing as NSString).deletingLastPathComponent
+            guard !parent.isEmpty, parent != existing else { return standard }
+            missing.insert((existing as NSString).lastPathComponent, at: 0)
+            existing = parent
+        }
+        let base = URL(fileURLWithPath: existing).resolvingSymlinksInPath().path
+        return missing.reduce(base) { ($0 as NSString).appendingPathComponent($1) }
     }
 
     public static func samePath(_ a: String, _ b: String) -> Bool { resolved(a) == resolved(b) }
+
+    /// Removed for good: its `.git` went with the folder (`git worktree remove`, `rm`, Cleanup). Never "missing from
+    /// `git worktree list`", which a failing git command would also give.
+    public static func isGone(_ path: String) -> Bool {
+        !FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(".git"))
+    }
 
     static func parse(_ porcelain: String) -> [Worktree] {
         var items: [Worktree] = []
@@ -96,6 +113,18 @@ public enum Worktrees {
         let r = Shell.run("git", ["-C", path, "rev-parse", "--show-toplevel"])
         let top = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return r.status == 0 && !top.isEmpty ? top : nil
+    }
+}
+
+public extension StoreData {
+    /// Forgets checkouts that were removed: tasks stop pointing at them and their environments leave the list.
+    /// Returns those environments, whose leftover processes the caller stops.
+    @discardableResult
+    mutating func forgetCheckouts(_ paths: Set<String>) -> [RunningEnvironment] {
+        let dropped = runningEnvironments.filter { paths.contains($0.worktreePath) }
+        runningEnvironments.removeAll { paths.contains($0.worktreePath) }
+        for i in tasks.indices where tasks[i].worktreePath.map(paths.contains) == true { tasks[i].worktreePath = nil }
+        return dropped
     }
 }
 

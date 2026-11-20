@@ -163,7 +163,9 @@ struct TaskDetailView: View {
     private var worktreeCard: some View {
         Card {
             if let wt = model.worktree(for: task) {
-                CardHeader(title: "Local environment", description: wt.isInstalled ? nil : "Not installed yet — the first Quickstart runs yarn install and yarn build (a few minutes).")
+                CardHeader(title: "Local environment", description: wt.isInstalled ? nil : "Not installed yet — the first Quickstart runs yarn install and yarn build (a few minutes).") {
+                    UpdateBranchButton(path: wt.path)
+                }
                 PathField(path: wt.path)
                 WorktreeActions(path: wt.path)
                 Divider().overlay(Theme.border)

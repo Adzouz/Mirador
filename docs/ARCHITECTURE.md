@@ -51,12 +51,39 @@ Each source fails independently; errors go to the toolbar and `~/Library/Logs/Mi
 `EnvironmentRunner` starts two processes per checkout, each in its own process group, logging to
 `~/Library/Logs/Mirador/<folder>-{watch,develop}.log`:
 
-- `yarn watch` (waits until the first build exists)
-- `yarn install` if needed → `yarn build` if needed → `cd <app> && PORT=<port> yarn develop --watch-admin`
+- install / build if needed → `cd <app> && PORT=<port> yarn develop --watch-admin`
+- `yarn watch`, once install and build are done (it rebuilds on changes, never on start)
+
+"If needed" (`EnvironmentRunner.preparation`): missing install / build markers (fresh checkout: `yarn install`, full
+`yarn build`), or what changed since the commit of the last build Mirador ran, recorded per checkout in
+`~/Library/Application Support/Mirador/environments/<folder>-<hash>.built`. A changed `package.json` or lockfile →
+`yarn install`; changed files under `packages/` → `nx run-many --targets build:code,build:types --projects <their
+folders>` (what `yarn watch` runs on a change); shared build setup (root `package.json`, `yarn.lock`, `nx.json`,
+`rollup.utils.mjs`) → full `yarn build`. No record yet → the build is assumed to match HEAD (the old behaviour). The
+start script writes its phase to `<folder>-<hash>.phase`: the app shows it while starting, `yarn watch` waits for
+`starting`.
+
+**Removed checkouts.** A checkout is gone once its `.git` is (`Worktrees.isGone`), never because `git worktree list`
+omits it (a failing git call omits everything). Every 2 s, with the environment poll, the app checks the worktrees it
+lists, the running environments and the tasks' worktree links (file checks only), and the modification dates of the
+worktrees folder and `.git/worktrees` (any change refreshes the list). A removal drops the worktree from every list at
+once; `EnvironmentRunner.forgetRemovedCheckouts` forgets its environment, unlinks its tasks (the sync matches them
+again) and deletes its phase / build records. Leftover processes are stopped only when their group is still led by the
+process Mirador started (`isOurs`, by start time): recorded ids get reused. The sync, every start and
+`mirador env status` do the same for removals made while the app was closed.
 
 A task's environment is `Worktrees.resolve`: its linked worktree, else the best match by branch / `pr-<n>` folder /
 Linear key, **never the monorepo checkout** (shared, switches branches). Two slots: the monorepo and one worktree, each on its port from Settings. Starting a checkout stops only what runs in
-its slot. State = process groups alive + port answering; startup phase is read from install / build markers.
+its slot. State = process groups alive + port answering; startup phase is read from the phase file (install / build
+markers for environments started by an older version).
+
+**Update branch** (worktrees; `BranchUpdate`): fetches what the checkout follows (its upstream, else
+`refs/pull/<n>/head` for a detached PR checkout, else the same branch name on strapi/strapi) and fast-forwards. A
+force-pushed branch is followed (`reset --keep`) only when HEAD was that remote branch at some point (`merge-base
+--fork-point` over the remote-tracking ref's reflog); otherwise the app asks, saying how many commits would be dropped
+and whose. Uncommitted changes are never overwritten. The app then restarts the environment if it runs, and the start
+rebuilds what the pull changed. With no record yet, the commit from before the update is recorded as the built one, so
+that start still sees the change.
 When an environment reaches Running and the super admin option is on, `AdminBootstrap` calls
 `GET /admin/init` and, if there is no admin, `POST /admin/register-admin`.
 
