@@ -1157,3 +1157,78 @@ private struct Remote {
     #expect(BranchUpdate.label(remote: ".", ref: "refs/heads/develop", tracking: nil) == "develop")
     #expect(BranchUpdate.firstLine(of: "\nfatal: unable to access 'x': timeout\nmore") == "unable to access 'x': timeout")
 }
+
+// MARK: Removed checkouts
+
+@Test func forgetCheckoutsUnlinksTasksAndDropsEnvironments() {
+    var data = StoreData()
+    var a = TrackedTask(kind: .fix, title: "A", status: .inProgress, source: "local")
+    a.worktreePath = "/wt/a"
+    var b = TrackedTask(kind: .fix, title: "B", status: .inProgress, source: "local")
+    b.worktreePath = "/wt/b"
+    data.tasks = [a, b]
+    data.runningEnvironments = [RunningEnvironment(worktreePath: "/wt/a", processGroups: [1234], port: 1339)]
+    let dropped = data.forgetCheckouts(["/wt/a"])
+    #expect(dropped.map(\.worktreePath) == ["/wt/a"])
+    #expect(data.runningEnvironments.isEmpty)
+    #expect(data.tasks.map(\.worktreePath) == [nil, "/wt/b"])
+}
+
+@Test func removedCheckoutsAreForgottenAndOnlyTheirOwnProcessesStopped() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = Store(directory: root.appendingPathComponent("store"))
+    let checkout = { (name: String) -> String in
+        let path = root.appendingPathComponent(name).path
+        try? FileManager.default.createDirectory(atPath: path + "/.git", withIntermediateDirectories: true)
+        return path
+    }
+    let removed = checkout("pr-1"), reused = checkout("pr-2"), kept = checkout("pr-3")
+    // Processes that outlive their deleted folder, like Strapi holding its port.
+    let log = root.appendingPathComponent("spawn.log")
+    let ours = try EnvironmentRunner.spawn("exec sleep 60", cwd: removed, log: log)
+    let someoneElse = try EnvironmentRunner.spawn("exec sleep 60", cwd: reused, log: log)
+    defer {
+        kill(-someoneElse, SIGKILL)
+        _ = waitpid(someoneElse, nil, 0)
+    }
+    store.update { data in
+        data.runningEnvironments = [
+            RunningEnvironment(worktreePath: removed, processGroups: [ours], port: 1339),
+            // Recorded a day ago: that process group id now leads another process.
+            RunningEnvironment(worktreePath: reused, processGroups: [someoneElse], port: 1338, startedAt: Date().addingTimeInterval(-86_400)),
+        ]
+        var review = TrackedTask(kind: .review, title: "PR", status: .reviewing, source: "github")
+        review.worktreePath = removed
+        var fix = TrackedTask(kind: .fix, title: "Fix", status: .inProgress, source: "local")
+        fix.worktreePath = kept
+        data.tasks = [review, fix]
+    }
+    EnvironmentRunner.recordBuildIfUnknown(of: removed, at: "abc", store: store)
+    let record = EnvironmentRunner.stateURL(for: removed, "built", store: store)
+    #expect(EnvironmentRunner.forgetRemovedCheckouts(store: store).isEmpty)
+
+    try FileManager.default.removeItem(atPath: removed)
+    try FileManager.default.removeItem(atPath: reused)
+    #expect(EnvironmentRunner.forgetRemovedCheckouts(store: store) == [removed, reused])
+    let data = store.load()
+    #expect(data.runningEnvironments.isEmpty)
+    #expect(data.tasks.map(\.worktreePath) == [nil, kept])
+    #expect(!EnvironmentRunner.isAlive(ours))
+    #expect(EnvironmentRunner.isAlive(someoneElse))
+    #expect(!FileManager.default.fileExists(atPath: record.path))
+}
+
+@Test func removedPathResolvesAsItDidBefore() throws {
+    // The temporary folder sits behind the /var → /private/var symlink.
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let path = root.appendingPathComponent("wt/pr-1").path
+    try FileManager.default.createDirectory(atPath: path + "/.git", withIntermediateDirectories: true)
+    let before = Worktrees.resolved(path)
+    #expect(!Worktrees.isGone(path))
+    try FileManager.default.removeItem(at: root.appendingPathComponent("wt"))
+    #expect(Worktrees.resolved(path) == before)
+    #expect(Worktrees.isGone(path))
+    #expect(Worktrees.resolved("relative/missing") == "relative/missing")
+}

@@ -48,7 +48,7 @@ These come from the maintainer's feedback; keep them when adding features.
 | Pings (review requests, mentions, re-reviews, red CI, Linear) | `Pings.swift`, PingsView in `MainView.swift` | Search by `#PR`, `@user`, words; mark read; bulk delete. |
 | Links (PR, GitHub issue, Linear ticket per task; merge on conflict; unlink sticks) | `Links.swift`, `AddTaskSheet.swift` (link mode), `TaskDetailView.swift` header | One of each type per task. |
 | **Auto-archive + History** | `Archive.swift` | Merged / closed PRs, PR-less tickets done in Linear, PR-less ticket-less closed issues. Unarchive sticks until the status changes. |
-| Worktrees per task, Quickstart (monorepo + one worktree side by side) | `Worktrees.swift`, `WorktreeCreator.swift`, `EnvironmentRunner.swift`, `EnvironmentsView.swift` | A task never resolves to the monorepo checkout. Starts rebuild only what changed since the last build. |
+| Worktrees per task, Quickstart (monorepo + one worktree side by side) | `Worktrees.swift`, `WorktreeCreator.swift`, `EnvironmentRunner.swift`, `EnvironmentsView.swift` | A task never resolves to the monorepo checkout. Starts rebuild only what changed since the last build. Worktrees removed outside Mirador leave every list within seconds, with their environment and task links. |
 | **Update branch** (pull a worktree's new commits, restart it) | `BranchUpdate.swift`, `UpdateBranchButton` in `Components.swift`, `AppModel.updateBranch` | Worktrees only. A force-push is followed when nothing local is lost; otherwise the app asks. |
 | Cleanup of merged / closed branches and worktrees | `Cleanup.swift`, `CleanupView.swift` | Local scan first, then GitHub. |
 | Menu bar panel | `MenuBarView.swift` | Shows only the focus card in focus mode. |

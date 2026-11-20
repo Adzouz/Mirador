@@ -183,6 +183,8 @@ public enum EnvironmentRunner {
         guard FileManager.default.fileExists(atPath: appPath) else { throw RunError.missingApp(appDirectory, worktreePath) }
 
         let port = settings.port(for: worktreePath)
+        // A removed checkout still listed in the slot is forgotten, not "stopped" through process ids that may be reused.
+        forgetRemovedCheckouts(store: store)
         stop(slotOf: worktreePath, store: store)
         killPortListeners(port: port)
 
@@ -230,6 +232,40 @@ public enum EnvironmentRunner {
 
     public static func stopAll(store: Store) {
         for env in store.load().runningEnvironments { stop(path: env.worktreePath, store: store) }
+    }
+
+    // MARK: Removed checkouts
+
+    /// Checkouts removed outside Mirador (a terminal, another tool): their environments leave the list, tasks stop
+    /// pointing at them, and what is left of their processes is stopped (Strapi can outlive its deleted folder and keep
+    /// the port). Returns their paths.
+    @discardableResult
+    public static func forgetRemovedCheckouts(store: Store) -> [String] {
+        let data = store.load()
+        let gone = Set(data.runningEnvironments.map(\.worktreePath) + data.tasks.compactMap(\.worktreePath)).filter(Worktrees.isGone)
+        guard !gone.isEmpty else { return [] }
+        let dropped = store.update { $0.forgetCheckouts(gone.filter(Worktrees.isGone)) }
+        for env in dropped { terminate(groups: env.processGroups.filter { isOurs($0, startedAt: env.startedAt) }) }
+        for path in gone { forgetState(of: path, store: store) }
+        return gone.sorted()
+    }
+
+    /// Drops a checkout's phase and build records.
+    public static func forgetState(of path: String, store: Store) {
+        for kind in ["phase", "built"] { try? FileManager.default.removeItem(at: stateURL(for: path, kind, store: store)) }
+    }
+
+    /// Whether `group` is still led by the process started for an environment at `startedAt`. Process ids are reused
+    /// (after a reboot, or a while): a recorded group can belong to someone else by now.
+    static func isOurs(_ group: Int32, startedAt: Date) -> Bool {
+        guard group > 1 else { return false }
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, group]
+        guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0, size > 0, info.kp_eproc.e_pgid == group else { return false }
+        let start = info.kp_proc.p_un.__p_starttime
+        let started = Date(timeIntervalSince1970: TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1_000_000)
+        return abs(started.timeIntervalSince(startedAt)) < 30
     }
 
     public static func state(of worktreePath: String, store: Store) -> EnvironmentState {

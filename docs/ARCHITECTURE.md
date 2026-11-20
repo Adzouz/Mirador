@@ -63,6 +63,15 @@ folders>` (what `yarn watch` runs on a change); shared build setup (root `packag
 start script writes its phase to `<folder>-<hash>.phase`: the app shows it while starting, `yarn watch` waits for
 `starting`.
 
+**Removed checkouts.** A checkout is gone once its `.git` is (`Worktrees.isGone`), never because `git worktree list`
+omits it (a failing git call omits everything). Every 2 s, with the environment poll, the app checks the worktrees it
+lists, the running environments and the tasks' worktree links (file checks only), and the modification dates of the
+worktrees folder and `.git/worktrees` (any change refreshes the list). A removal drops the worktree from every list at
+once; `EnvironmentRunner.forgetRemovedCheckouts` forgets its environment, unlinks its tasks (the sync matches them
+again) and deletes its phase / build records. Leftover processes are stopped only when their group is still led by the
+process Mirador started (`isOurs`, by start time): recorded ids get reused. The sync, every start and
+`mirador env status` do the same for removals made while the app was closed.
+
 A task's environment is `Worktrees.resolve`: its linked worktree, else the best match by branch / `pr-<n>` folder /
 Linear key, **never the monorepo checkout** (shared, switches branches). Two slots: the monorepo and one worktree, each on its port from Settings. Starting a checkout stops only what runs in
 its slot. State = process groups alive + port answering; startup phase is read from the phase file (install / build

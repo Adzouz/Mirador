@@ -106,3 +106,7 @@ swift test                  # must stay green; add a test for every rule you add
   so nothing proves a force-push only dropped the author's commits, and Update branch asks first.
 - `zsh -c` reads `~/.zshenv`, where Volta / nvm put the real `yarn` first in PATH: tests running generated scripts with
   a fake `yarn` use `zsh -f`.
+- Worktrees get removed behind Mirador's back (a terminal, review tooling). Tell "removed" by its `.git` being gone
+  (`Worktrees.isGone`), never by absence from `git worktree list`, which a failing git call also gives.
+- Recorded process group ids outlive their processes (reboot, time) and get reused by unrelated ones: anything Mirador
+  kills on its own checks the group leader's start time first (`EnvironmentRunner.isOurs`).

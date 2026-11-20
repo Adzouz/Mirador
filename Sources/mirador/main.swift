@@ -234,6 +234,7 @@ case "env":
         if args.flags.contains("all") || path == nil { EnvironmentRunner.stopAll(store: store) } else { EnvironmentRunner.stop(path: path!, store: store) }
         print("Stopped.")
     default:
+        EnvironmentRunner.forgetRemovedCheckouts(store: store)
         let envs = store.load().runningEnvironments
         if envs.isEmpty { print("No environment running.") }
         for env in envs {

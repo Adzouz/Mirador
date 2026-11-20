@@ -340,6 +340,8 @@ final class AppModel {
         let store = store
         let generation = worktreesGeneration
         Task.detached {
+            // Removed while the app was closed: unlinked tasks get matched again below.
+            EnvironmentRunner.forgetRemovedCheckouts(store: store)
             let worktrees = Worktrees.list(settings: store.load().settings)
             let activity = LocalWork.activity(in: worktrees)
             var pings: [Ping] = []
@@ -502,14 +504,46 @@ final class AppModel {
     func forgetWorktrees(_ paths: [String]) {
         guard !paths.isEmpty else { return }
         let removed = Set(paths)
-        store.update { data in
-            for i in data.tasks.indices where data.tasks[i].worktreePath.map(removed.contains) == true {
-                data.tasks[i].worktreePath = nil
-            }
-        }
+        store.update { $0.forgetCheckouts(removed) }
+        for path in paths { EnvironmentRunner.forgetState(of: path, store: store) }
+        if removed.contains(lastWorktreePath) { lastWorktreePath = "" }
         reload()
         worktreesGeneration += 1
         refreshWorktrees()
+    }
+
+    private var forgettingCheckouts = false
+    /// Modification dates of the worktrees folder and of git's list of worktrees: a change means a worktree was added or
+    /// removed outside Mirador.
+    private var worktreeFolderDates: [Date?]?
+
+    /// Runs with the environment poll, so a worktree added or removed from a terminal or another tool shows within
+    /// seconds instead of at the next sync. File dates and `.git` checks only: no git on the main actor.
+    private func followCheckouts() {
+        let folders = [settings.worktreesPath, (settings.repoPath as NSString).appendingPathComponent(".git/worktrees")]
+        let dates = folders.map { (try? FileManager.default.attributesOfItem(atPath: ($0 as NSString).standardizingPath))?[.modificationDate] as? Date }
+        if dates != worktreeFolderDates {
+            if worktreeFolderDates != nil { refreshWorktrees() }
+            worktreeFolderDates = dates
+        }
+
+        guard !forgettingCheckouts else { return }
+        let known = Set(worktrees.map(\.path) + running.map(\.worktreePath) + tasks.compactMap(\.worktreePath))
+        let gone = known.filter(Worktrees.isGone)
+        guard !gone.isEmpty else { return }
+        forgettingCheckouts = true
+        worktrees.removeAll { gone.contains($0.path) }
+        if gone.contains(lastWorktreePath) { lastWorktreePath = "" }
+        worktreesGeneration += 1
+        let store = store
+        Task.detached {
+            EnvironmentRunner.forgetRemovedCheckouts(store: store)
+            await MainActor.run {
+                self.forgettingCheckouts = false
+                self.reload()
+                self.refreshWorktrees()
+            }
+        }
     }
 
     func createWorktree(for task: TrackedTask) {
@@ -591,6 +625,7 @@ final class AppModel {
     }
 
     private func pollEnvironment() {
+        followCheckouts()
         guard busyEnvironment == nil else { return }
         var states: [String: EnvironmentState] = [:]
         for env in running { states[env.worktreePath] = EnvironmentRunner.state(of: env.worktreePath, store: store) }
