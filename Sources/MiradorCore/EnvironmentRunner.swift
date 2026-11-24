@@ -288,27 +288,13 @@ public enum EnvironmentRunner {
         posix_spawn_file_actions_adddup2(&fileActions, 1, 2)
         posix_spawn_file_actions_addchdir_np(&fileActions, cwd)
 
-        var attr: posix_spawnattr_t? = nil
-        posix_spawnattr_init(&attr)
-        defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
-        posix_spawnattr_setpgroup(&attr, 0)
-
         var env = Shell.userEnvironment
         for (k, v) in extraEnv { env[k] = v }
         env["FORCE_COLOR"] = "0"
-        let args = ["/bin/zsh", "-lc", command]
-        let cArgs = args.map { strdup($0) } + [nil]
-        let cEnv = env.map { strdup("\($0.key)=\($0.value)") } + [nil]
-        defer {
-            cArgs.forEach { free($0) }
-            cEnv.forEach { free($0) }
+        switch Shell.spawn(["/bin/zsh", "-lc", command], environment: env, actions: &fileActions, newProcessGroup: true) {
+        case .success(let pid): return pid
+        case .failure(let error): throw RunError.spawn(error.message)
         }
-
-        var pid: pid_t = 0
-        let rc = posix_spawn(&pid, "/bin/zsh", &fileActions, &attr, cArgs, cEnv)
-        guard rc == 0 else { throw RunError.spawn(String(cString: strerror(rc))) }
-        return pid
     }
 
     static func terminate(groups: [Int32]) {

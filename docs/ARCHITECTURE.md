@@ -79,9 +79,11 @@ markers for environments started by an older version).
 
 **Update branch** (worktrees; `BranchUpdate`): fetches what the checkout follows (its upstream, else
 `refs/pull/<n>/head` for a detached PR checkout, else the same branch name on strapi/strapi) and fast-forwards. A
-force-pushed branch is followed (`reset --keep`) only when HEAD was that remote branch at some point (`merge-base
---fork-point` over the remote-tracking ref's reflog); otherwise the app asks, saying how many commits would be dropped
-and whose. Uncommitted changes are never overwritten. The app then restarts the environment if it runs, and the start
+force-pushed branch (commits reworded or only dropped) is followed (`reset --keep`) only when HEAD was that remote
+branch at some point (`merge-base --fork-point` over the remote-tracking ref's reflog) and none of the commits it drops
+were committed by the local git user (a pushed commit of theirs is in that reflog too); otherwise the app asks, saying
+how many commits would be dropped and whose. Uncommitted changes are never overwritten, and a checkout whose HEAD moved
+during the fetch is left alone. The app then restarts the environment if it runs, and the start
 rebuilds what the pull changed. With no record yet, the commit from before the update is recorded as the built one, so
 that start still sees the change.
 When an environment reaches Running and the super admin option is on, `AdminBootstrap` calls

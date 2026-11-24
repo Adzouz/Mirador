@@ -2,8 +2,9 @@ import Foundation
 
 /// Moves a checkout to the latest commits of what it follows: its upstream (like `git pull --ff-only`), else its PR
 /// (`refs/pull/<n>/head`, for detached `gh pr checkout`s), else the same branch name on the strapi/strapi remote.
-/// Beyond a fast-forward, it follows a branch rewritten on the remote (force-push) only when every commit of the
-/// checkout was on that remote at some point. Dropping anything else is for the user to confirm.
+/// Beyond a fast-forward, it follows a branch rewritten on the remote (force-push, commits dropped or reworded) only
+/// when every commit of the checkout was on that remote at some point and none of the dropped ones are the user's.
+/// Dropping anything else is for the user to confirm.
 public enum BranchUpdate {
     /// Where the latest commits come from.
     public struct Source: Equatable, Sendable {
@@ -44,15 +45,28 @@ public enum BranchUpdate {
         guard fetch.status == 0 else { return .failed(fetchError(fetch.stderr, source: source)) }
         guard let latest = commit("FETCH_HEAD", in: path) else { return .failed("Could not read the fetched commit.") }
 
-        if isAncestor(latest, of: head, in: path) { return .upToDate(source) }
+        if latest == head { return .upToDate(source) }
+        let range = "\(latest)..\(head)"
+        let diverged = { Outcome.diverged(Divergence(source: source, commits: count(range, in: path), mine: mine(range, in: path))) }
         let move: [String]
         if isAncestor(head, of: latest, in: path) {
             move = ["merge", "--ff-only", "--quiet", latest]
-        } else if replacingLocal || wasOnRemote(head, source: source, in: path) {
+        } else if replacingLocal {
             move = ["reset", "--keep", latest]
+        } else if wasOnRemote(head, source: source, in: path) {
+            // The remote rewrote or dropped commits it had. A pushed commit of the user's is in that reflog too: never
+            // drop it unasked (nor anything when `user.email` is unknown).
+            guard mine(range, in: path) == 0 else { return diverged() }
+            move = ["reset", "--keep", latest]
+        } else if isAncestor(latest, of: head, in: path) {
+            // Commits not pushed yet: nothing to pull.
+            return .upToDate(source)
         } else {
-            let range = "\(latest)..\(head)"
-            return .diverged(Divergence(source: source, commits: count(range, in: path), mine: mine(range, in: path)))
+            return diverged()
+        }
+        // The checks above hold for the HEAD read before the fetch; a commit made meanwhile was never looked at.
+        guard commit("HEAD", in: path) == head else {
+            return .failed("The checkout changed during the update. Update again.")
         }
         let moved = Shell.git(move, in: path)
         return moved.status == 0 ? .updated(from: head, to: latest, source) : .failed(moveError(moved.stderr))

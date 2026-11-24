@@ -1042,6 +1042,58 @@ private struct Remote {
     #expect(try String(contentsOf: r.work.appendingPathComponent("a.txt"), encoding: .utf8) == "one\nTWO\n")
 }
 
+@Test func updateFollowsAForcePushThatOnlyDropsCommits() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    // The author drops their last commit: what the checkout has is no longer in the PR.
+    gitIn(r.other)(["reset", "-q", "--hard", "HEAD~1"])
+    gitIn(r.other)(["push", "-q", "-f", "origin", "main"])
+    let before = r.head(r.work)
+    guard case .updated(let from, let to, _) = BranchUpdate.run(at: r.work.path) else { Issue.record("expected updated"); return }
+    #expect(from == before && to == r.head(r.other))
+    #expect(r.head(r.work) == r.head(r.other))
+}
+
+@Test func updateAsksBeforeDroppingPushedCommitsOfTheUser() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    // I push a fix to the branch; its author force-pushes a rewrite that does not have it.
+    try write("my fix\n", to: r.work, "b.txt")
+    r.commit(r.work, "my fix")
+    gitIn(r.work)(["push", "-q", "origin", "main"])
+    try write("one\nTWO\n", to: r.other, "a.txt")
+    gitIn(r.other, as: "other@example.com")(["commit", "-qa", "--amend", "-m", "second, reworded"])
+    gitIn(r.other)(["push", "-q", "-f", "origin", "main"])
+    let mine = r.head(r.work)
+
+    guard case .diverged(let d) = BranchUpdate.run(at: r.work.path) else { Issue.record("expected diverged"); return }
+    #expect(d.commits == 2 && d.mine == 1)
+    #expect(r.head(r.work) == mine)
+}
+
+@Test func updateNeverMovesACheckoutThatChangedDuringTheFetch() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    try write("one\nTWO\n", to: r.other, "a.txt")
+    gitIn(r.other, as: "other@example.com")(["commit", "-qa", "--amend", "-m", "second, reworded"])
+    gitIn(r.other)(["push", "-q", "-f", "origin", "main"])
+    // A commit lands while `git fetch` runs (the fetch updates origin/main, which runs this hook once).
+    let hook = r.work.appendingPathComponent(".git/hooks/reference-transaction")
+    try """
+        #!/bin/sh
+        [ "$1" = committed ] && [ ! -e .git/late-done ] || exit 0
+        touch .git/late-done
+        git -c user.name=Test -c commit.gpgsign=false commit -q --allow-empty -m late
+        """.write(to: hook, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+    let before = r.head(r.work)
+
+    #expect(BranchUpdate.run(at: r.work.path) == .failed("The checkout changed during the update. Update again."))
+    let late = r.head(r.work)
+    #expect(late != before)
+    #expect(BranchUpdate.commit("HEAD~1", in: r.work.path) == before)
+}
+
 @Test func updateAsksBeforeDroppingLocalCommits() throws {
     let r = try Remote()
     defer { r.cleanUp() }
@@ -1219,6 +1271,51 @@ private struct Remote {
     #expect(!FileManager.default.fileExists(atPath: record.path))
 }
 
+/// Every thread of the cooperative pool blocked in `Shell.run` at once (busy detached tasks; parallel tests on a 3-core
+/// CI runner) used to deadlock: each waited for a stderr reader queued on a global queue that never got a thread.
+@Test(.timeLimit(.minutes(1))) func shellRunNeedsNoOtherThread() async {
+    let calls = ProcessInfo.processInfo.activeProcessorCount * 2
+    let results = await withTaskGroup(of: Shell.Result.self) { group in
+        for i in 0..<calls {
+            group.addTask { Shell.run("/bin/sh", ["-c", "sleep 0.2; echo out \(i); echo err \(i) >&2; exit 3"]) }
+        }
+        return await group.reduce(into: []) { $0.append($1) }
+    }
+    #expect(results.count == calls)
+    #expect(results.allSatisfy { $0.status == 3 && $0.stdout.hasPrefix("out ") && $0.stderr.hasPrefix("err ") })
+}
+
+/// Tests, like the app's detached tasks, run on worker threads, which block signals: a spawned tree used to inherit
+/// that mask (SIGTERM ignored, every stop waiting for SIGKILL) and every open file of the caller.
+@Test func spawnedEnvironmentsStopOnSIGTERMAndHoldNoOtherFiles() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // Open while spawning, like the pipes of a `Shell.run` in another thread.
+    var fds: [Int32] = [0, 0]
+    #expect(pipe(&fds) == 0)
+    defer { close(fds[0]) }
+    let group = try EnvironmentRunner.spawn("exec sleep 30", cwd: root.path, log: root.appendingPathComponent("spawn.log"))
+    defer {
+        kill(-group, SIGKILL)
+        _ = waitpid(group, nil, 0)
+    }
+    close(fds[1])
+    _ = fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK)
+    // A child drops what it does not inherit as it starts, not always before `posix_spawn` returns: wait for the end of
+    // file. Still -1 (EAGAIN) after that: the spawned tree holds the write end.
+    var ready = pollfd(fd: fds[0], events: Int16(POLLIN), revents: 0)
+    _ = poll(&ready, 1, 3_000)
+    var byte: UInt8 = 0
+    #expect(read(fds[0], &byte, 1) == 0)
+
+    usleep(300_000)
+    let start = Date()
+    EnvironmentRunner.terminate(groups: [group])
+    #expect(Date().timeIntervalSince(start) < 3)
+    #expect(!EnvironmentRunner.isAlive(group))
+}
+
 @Test func removedPathResolvesAsItDidBefore() throws {
     // The temporary folder sits behind the /var → /private/var symlink.
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
@@ -1231,4 +1328,23 @@ private struct Remote {
     #expect(Worktrees.resolved(path) == before)
     #expect(Worktrees.isGone(path))
     #expect(Worktrees.resolved("relative/missing") == "relative/missing")
+}
+
+/// `mirador env start .` used to store ".", which the app (running from `/`) took for a removed checkout.
+@Test func checkoutPathsFromTheCommandLineAreAbsolute() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repo = root.appendingPathComponent("pr-1")
+    try FileManager.default.createDirectory(at: repo.appendingPathComponent("examples/getstarted"), withIntermediateDirectories: true)
+    gitIn(repo)(["init", "-q", "-b", "main"])
+
+    #expect(!Worktrees.isGone("."))
+    #expect(Worktrees.samePath(Worktrees.checkoutPath(".", cwd: repo.path), repo.path))
+    // A folder inside the checkout gives the checkout.
+    #expect(Worktrees.samePath(Worktrees.checkoutPath("examples/getstarted", cwd: repo.path), repo.path))
+    #expect(Worktrees.samePath(Worktrees.checkoutPath("../pr-1/examples", cwd: root.appendingPathComponent("pr-2").path), repo.path))
+    // Not a checkout (yet): kept as typed, made absolute.
+    let other = Worktrees.checkoutPath("../pr-2", cwd: repo.path)
+    #expect(other.hasPrefix("/") && Worktrees.samePath(other, root.appendingPathComponent("pr-2").path))
+    #expect(Worktrees.checkoutPath("~/x", cwd: "/") == NSHomeDirectory() + "/x")
 }

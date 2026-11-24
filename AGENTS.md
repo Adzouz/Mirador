@@ -108,5 +108,11 @@ swift test                  # must stay green; add a test for every rule you add
   a fake `yarn` use `zsh -f`.
 - Worktrees get removed behind Mirador's back (a terminal, review tooling). Tell "removed" by its `.git` being gone
   (`Worktrees.isGone`), never by absence from `git worktree list`, which a failing git call also gives.
+- `Shell.run` is called from cooperative threads (detached tasks, Swift Testing). Anything it waits on must not need
+  another thread: a stderr reader on a global queue deadlocked the CI tests once every thread of the 3-core runner's pool
+  was in `Shell.run`. It reads both pipes with `poll` on the calling thread and reaps with `waitpid` (no `Process`).
+- Worker threads block signals and a spawned child keeps that mask: without `POSIX_SPAWN_SETSIGMASK` / `SETSIGDEF`,
+  Strapi ignored SIGTERM and every stop waited for SIGKILL. `Shell.spawn` also sets `POSIX_SPAWN_CLOEXEC_DEFAULT` so a
+  long-lived tree holds no other thread's pipe open.
 - Recorded process group ids outlive their processes (reboot, time) and get reused by unrelated ones: anything Mirador
   kills on its own checks the group leader's start time first (`EnvironmentRunner.isOurs`).

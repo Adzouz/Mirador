@@ -61,9 +61,11 @@ public enum Worktrees {
     public static func samePath(_ a: String, _ b: String) -> Bool { resolved(a) == resolved(b) }
 
     /// Removed for good: its `.git` went with the folder (`git worktree remove`, `rm`, Cleanup). Never "missing from
-    /// `git worktree list`", which a failing git command would also give.
+    /// `git worktree list`", which a failing git command would also give. A relative path says nothing: it depends on
+    /// who reads it (the app runs from `/`).
     public static func isGone(_ path: String) -> Bool {
-        !FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(".git"))
+        guard (path as NSString).isAbsolutePath else { return false }
+        return !FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(".git"))
     }
 
     static func parse(_ porcelain: String) -> [Worktree] {
@@ -113,6 +115,15 @@ public enum Worktrees {
         let r = Shell.run("git", ["-C", path, "rev-parse", "--show-toplevel"])
         let top = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return r.status == 0 && !top.isEmpty ? top : nil
+    }
+
+    /// A checkout typed on the command line (`.`, `../pr-2`, `~/wt/x`), as the app must store it: absolute (the app
+    /// runs from `/`) and at the checkout's top level when it is one.
+    public static func checkoutPath(_ argument: String, cwd: String) -> String {
+        let expanded = (argument as NSString).expandingTildeInPath
+        let absolute = (expanded as NSString).isAbsolutePath ? expanded : (cwd as NSString).appendingPathComponent(expanded)
+        let standard = (absolute as NSString).standardizingPath
+        return topLevel(at: standard) ?? standard
     }
 }
 
