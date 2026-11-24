@@ -112,7 +112,7 @@ public enum Worktrees {
     }
 
     public static func topLevel(at path: String) -> String? {
-        let r = Shell.run("git", ["-C", path, "rev-parse", "--show-toplevel"])
+        let r = Shell.git(["rev-parse", "--show-toplevel"], in: path)
         let top = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return r.status == 0 && !top.isEmpty ? top : nil
     }

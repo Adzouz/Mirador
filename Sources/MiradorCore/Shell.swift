@@ -81,10 +81,12 @@ public enum Shell {
             }
         }
         var status: Int32 = 0
-        while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+        var reaped: pid_t
+        repeat { reaped = waitpid(pid, &status, 0) } while reaped == -1 && errno == EINTR
         let signal = status & 0x7f
         return Result(
-            status: signal == 0 ? (status >> 8) & 0xff : 128 + signal,
+            // No exit status (the child was reaped elsewhere) is never success.
+            status: reaped != pid ? -1 : signal == 0 ? (status >> 8) & 0xff : 128 + signal,
             stdout: String(decoding: outData, as: UTF8.self),
             stderr: String(decoding: errData, as: UTF8.self)
         )

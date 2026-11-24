@@ -48,18 +48,21 @@ public enum BranchUpdate {
         if latest == head { return .upToDate(source) }
         let range = "\(latest)..\(head)"
         let diverged = { Outcome.diverged(Divergence(source: source, commits: count(range, in: path), mine: mine(range, in: path))) }
+        // The last commit of HEAD that was on the remote branch, per its reflog (`git pull --rebase`'s fork point).
+        let lastOnRemote = source.trackingRef.flatMap { output(["merge-base", "--fork-point", $0, head], in: path) }
         let move: [String]
         if isAncestor(head, of: latest, in: path) {
             move = ["merge", "--ff-only", "--quiet", latest]
         } else if replacingLocal {
             move = ["reset", "--keep", latest]
-        } else if wasOnRemote(head, source: source, in: path) {
-            // The remote rewrote or dropped commits it had. A pushed commit of the user's is in that reflog too: never
-            // drop it unasked (nor anything when `user.email` is unknown).
+        } else if lastOnRemote == head {
+            // Every commit here was on the remote, which rewrote or dropped some. A pushed commit of the user's is in
+            // that reflog too: never drop it unasked (nor anything when `user.email` is unknown).
             guard mine(range, in: path) == 0 else { return diverged() }
             move = ["reset", "--keep", latest]
-        } else if isAncestor(latest, of: head, in: path) {
-            // Commits not pushed yet: nothing to pull.
+        } else if isAncestor(latest, of: head, in: path), let lastOnRemote, isAncestor(lastOnRemote, of: latest, in: path) {
+            // Only commits that were never pushed: nothing to pull. Without a remote-tracking ref (a detached PR or a
+            // fork checkout) nothing tells them from commits the author dropped, so the user is asked.
             return .upToDate(source)
         } else {
             return diverged()
@@ -132,13 +135,6 @@ public enum BranchUpdate {
 
     // MARK: History
 
-    /// Whether `head` was the remote branch at some point, per its reflog (`git pull --rebase`'s fork point): then the
-    /// remote rewrote its own commits and following it loses nothing that only exists here.
-    static func wasOnRemote(_ head: String, source: Source, in path: String) -> Bool {
-        guard let tracking = source.trackingRef else { return false }
-        return output(["merge-base", "--fork-point", tracking, head], in: path) == head
-    }
-
     static func commit(_ rev: String, in path: String) -> String? {
         output(["rev-parse", "--verify", "--quiet", "\(rev)^{commit}"], in: path)
     }
@@ -151,10 +147,12 @@ public enum BranchUpdate {
         output(["rev-list", "--count", range], in: path).flatMap { Int($0) } ?? 0
     }
 
+    /// Commits the local git user wrote or committed: a suggestion applied on GitHub is committed by GitHub, a rebased
+    /// commit by whoever rebased it.
     static func mine(_ range: String, in path: String) -> Int? {
         guard let email = output(["config", "--get", "user.email"], in: path)?.lowercased() else { return nil }
-        return Shell.git(["log", "--format=%ce", range], in: path).stdout
-            .split(separator: "\n").filter { $0.lowercased() == email }.count
+        return Shell.git(["log", "--format=%ae %ce", range], in: path).stdout
+            .split(separator: "\n").filter { $0.lowercased().split(separator: " ").contains { $0 == email } }.count
     }
 
     static func output(_ args: [String], in path: String) -> String? {

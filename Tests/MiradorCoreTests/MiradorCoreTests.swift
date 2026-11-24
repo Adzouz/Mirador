@@ -1054,6 +1054,42 @@ private struct Remote {
     #expect(r.head(r.work) == r.head(r.other))
 }
 
+@Test func updateAsksWhenTheRemoteDroppedCommitsUnderLocalOnes() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    try write("one\ntwo\nthree\n", to: r.other, "a.txt")
+    r.commit(r.other, "third")
+    gitIn(r.other)(["push", "-q", "origin", "main"])
+    guard case .updated = BranchUpdate.run(at: r.work.path) else { Issue.record("expected updated"); return }
+    // A local commit on top of "third", then the author drops "third".
+    try write("mine\n", to: r.work, "b.txt")
+    r.commit(r.work, "local work")
+    gitIn(r.other)(["reset", "-q", "--hard", "HEAD~1"])
+    gitIn(r.other)(["push", "-q", "-f", "origin", "main"])
+    let local = r.head(r.work)
+
+    guard case .diverged(let d) = BranchUpdate.run(at: r.work.path) else { Issue.record("expected diverged"); return }
+    #expect(d.commits == 2 && d.mine == 1)
+    #expect(r.head(r.work) == local)
+}
+
+@Test func updateCountsCommitsTheUserWroteAsTheirs() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    // A suggestion of mine applied on GitHub: I am its author, GitHub its committer.
+    try write("one\ntwo\nsuggested\n", to: r.other, "a.txt")
+    gitIn(r.other, as: "other@example.com")(["commit", "-qa", "--author=Me <me@example.com>", "-m", "suggestion"])
+    gitIn(r.other)(["push", "-q", "origin", "main"])
+    guard case .updated = BranchUpdate.run(at: r.work.path) else { Issue.record("expected updated"); return }
+    gitIn(r.other)(["reset", "-q", "--hard", "HEAD~1"])
+    gitIn(r.other)(["push", "-q", "-f", "origin", "main"])
+    let suggestion = r.head(r.work)
+
+    guard case .diverged(let d) = BranchUpdate.run(at: r.work.path) else { Issue.record("expected diverged"); return }
+    #expect(d.commits == 1 && d.mine == 1)
+    #expect(r.head(r.work) == suggestion)
+}
+
 @Test func updateAsksBeforeDroppingPushedCommitsOfTheUser() throws {
     let r = try Remote()
     defer { r.cleanUp() }
@@ -1086,6 +1122,8 @@ private struct Remote {
         git -c user.name=Test -c commit.gpgsign=false commit -q --allow-empty -m late
         """.write(to: hook, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+    // A global `core.hooksPath` (secret scanners) would make git ignore .git/hooks.
+    gitIn(r.work)(["config", "core.hooksPath", hook.deletingLastPathComponent().path])
     let before = r.head(r.work)
 
     #expect(BranchUpdate.run(at: r.work.path) == .failed("The checkout changed during the update. Update again."))
@@ -1156,6 +1194,13 @@ private struct Remote {
     #expect(source.label == "#7" && source.ref == "refs/pull/7/head")
     #expect(to == r.head(r.other) && r.head(r.work) == to)
     #expect(BranchUpdate.run(at: r.work.path) == .failed("Nothing to update from: no remote branch or PR for this checkout."))
+
+    // The author drops that commit: no remote-tracking ref proves the checkout's extra commit was theirs, so ask.
+    gitIn(r.other)(["reset", "-q", "--hard", "HEAD~1"])
+    gitIn(r.other)(["push", "-q", "-f", "origin", "HEAD:refs/pull/7/head"])
+    guard case .diverged(let d) = BranchUpdate.run(at: r.work.path, prNumber: 7) else { Issue.record("expected diverged"); return }
+    #expect(d.commits == 1 && d.mine == 0 && d.source.label == "#7")
+    #expect(r.head(r.work) == to)
 }
 
 @Test func branchWithoutUpstreamFollowsTheSameNameOnTheRemote() throws {

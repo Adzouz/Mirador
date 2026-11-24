@@ -81,10 +81,12 @@ markers for environments started by an older version).
 `refs/pull/<n>/head` for a detached PR checkout, else the same branch name on strapi/strapi) and fast-forwards. A
 force-pushed branch (commits reworded or only dropped) is followed (`reset --keep`) only when HEAD was that remote
 branch at some point (`merge-base --fork-point` over the remote-tracking ref's reflog) and none of the commits it drops
-were committed by the local git user (a pushed commit of theirs is in that reflog too); otherwise the app asks, saying
-how many commits would be dropped and whose. Uncommitted changes are never overwritten, and a checkout whose HEAD moved
-during the fetch is left alone. The app then restarts the environment if it runs, and the start
-rebuilds what the pull changed. With no record yet, the commit from before the update is recorded as the built one, so
+were written or committed by the local git user (a pushed commit of theirs is in that reflog too); otherwise the app
+asks, saying how many commits would be dropped and whose. Commits on top of the new version count as not pushed yet
+("up to date") only when none of them was ever on the remote branch; with no remote-tracking ref (a detached PR or a
+fork checkout) nothing shows that, so the app asks. Uncommitted changes are never overwritten, and a checkout whose
+HEAD moved during the fetch is left alone. The app then restarts the environment if it runs, and the start rebuilds
+what the pull changed. With no record yet, the commit from before the update is recorded as the built one, so
 that start still sees the change.
 When an environment reaches Running and the super admin option is on, `AdminBootstrap` calls
 `GET /admin/init` and, if there is no admin, `POST /admin/register-admin`.
