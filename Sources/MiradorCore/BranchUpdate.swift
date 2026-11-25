@@ -22,8 +22,11 @@ public enum BranchUpdate {
         public var source: Source
         /// Commits in the checkout that the new version does not have.
         public var commits: Int
-        /// How many of them the local git user committed; nil when `user.email` is not set.
+        /// How many of them the local git user wrote or committed; nil when `user.email` is not set.
         public var mine: Int?
+        /// The checkout's commit and the fetched one these counts were made from: a confirmation covers only them.
+        public var head: String
+        public var latest: String
     }
 
     public enum Outcome: Equatable, Sendable {
@@ -34,9 +37,13 @@ public enum BranchUpdate {
         case failed(String)
     }
 
-    /// `replacingLocal` follows the new version even over commits it does not have (once the user confirmed).
+    /// `replacing`, a divergence the user confirmed, follows the new version over the commits it counted, and only while
+    /// both the checkout and the fetched version are still the ones it was made from (otherwise it is evaluated again).
     /// Uncommitted changes are always kept: git refuses to move rather than overwrite them.
-    public static func run(at path: String, prNumber: Int? = nil, replacingLocal: Bool = false) -> Outcome {
+    public static func run(at path: String, prNumber: Int? = nil, replacing: Divergence? = nil) -> Outcome {
+        if let operation = operationInProgress(at: path) {
+            return .failed("A \(operation) is in progress in this checkout. Finish or abort it, then update again.")
+        }
         guard let source = source(at: path, prNumber: prNumber) else {
             return .failed("Nothing to update from: no remote branch or PR for this checkout.")
         }
@@ -47,13 +54,15 @@ public enum BranchUpdate {
 
         if latest == head { return .upToDate(source) }
         let range = "\(latest)..\(head)"
-        let diverged = { Outcome.diverged(Divergence(source: source, commits: count(range, in: path), mine: mine(range, in: path))) }
+        let diverged = {
+            Outcome.diverged(Divergence(source: source, commits: count(range, in: path), mine: mine(range, in: path), head: head, latest: latest))
+        }
         // The last commit of HEAD that was on the remote branch, per its reflog (`git pull --rebase`'s fork point).
         let lastOnRemote = source.trackingRef.flatMap { output(["merge-base", "--fork-point", $0, head], in: path) }
         let move: [String]
         if isAncestor(head, of: latest, in: path) {
             move = ["merge", "--ff-only", "--quiet", latest]
-        } else if replacingLocal {
+        } else if let replacing, replacing.head == head, replacing.latest == latest {
             move = ["reset", "--keep", latest]
         } else if lastOnRemote == head {
             // Every commit here was on the remote, which rewrote or dropped some. A pushed commit of the user's is in
@@ -73,6 +82,19 @@ public enum BranchUpdate {
         }
         let moved = Shell.git(move, in: path)
         return moved.status == 0 ? .updated(from: head, to: latest, source) : .failed(moveError(moved.stderr))
+    }
+
+    /// A rebase, merge, cherry-pick, revert or bisect stopped in the checkout: git moves HEAD under them without a word.
+    static func operationInProgress(at path: String) -> String? {
+        let markers = [("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HEAD", "merge"),
+                       ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"), ("BISECT_LOG", "bisect")]
+        let r = Shell.git(["rev-parse"] + markers.flatMap { ["--git-path", $0.0] }, in: path)
+        guard r.status == 0 else { return nil }
+        for (marker, gitPath) in zip(markers, r.stdout.split(separator: "\n").map(String.init)) {
+            let full = (gitPath as NSString).isAbsolutePath ? gitPath : (path as NSString).appendingPathComponent(gitPath)
+            if FileManager.default.fileExists(atPath: full) { return marker.1 }
+        }
+        return nil
     }
 
     // MARK: Source

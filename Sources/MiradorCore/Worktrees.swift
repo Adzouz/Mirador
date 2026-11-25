@@ -26,9 +26,11 @@ public enum Worktrees {
     /// Worktrees git knows about, plus any checkout sitting in the worktrees folder.
     public static func list(settings: AppSettings = AppSettings()) -> [Worktree] {
         let repo = (settings.repoPath as NSString).standardizingPath
-        let result = Shell.run("git", ["-C", repo, "worktree", "list", "--porcelain"])
+        let result = Shell.git(["worktree", "list", "--porcelain"], in: repo)
         var items = result.status == 0 ? parse(result.stdout) : []
         for i in items.indices { items[i].isMain = samePath(items[i].path, repo) }
+        // git keeps listing a locked worktree whose folder was deleted: forgotten, it would come straight back.
+        items.removeAll { !$0.isMain && isGone($0.path) }
         let known = Set(items.map { resolved($0.path) })
         let folder = (settings.worktreesPath as NSString).standardizingPath
         let children = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
@@ -63,9 +65,16 @@ public enum Worktrees {
     /// Removed for good: its `.git` went with the folder (`git worktree remove`, `rm`, Cleanup). Never "missing from
     /// `git worktree list`", which a failing git command would also give. A relative path says nothing: it depends on
     /// who reads it (the app runs from `/`).
+    /// Only "no such file" counts: a lookup refused (privacy protection after a re-sign, permissions) or a volume that is
+    /// not mounted says nothing, and treating it as removed would stop running environments.
     public static func isGone(_ path: String) -> Bool {
         guard (path as NSString).isAbsolutePath else { return false }
-        return !FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(".git"))
+        var info = stat()
+        guard lstat((path as NSString).appendingPathComponent(".git"), &info) != 0 else { return false }
+        guard errno == ENOENT || errno == ENOTDIR else { return false }
+        let parts = (path as NSString).pathComponents
+        if parts.count > 2, parts[1] == "Volumes", !FileManager.default.fileExists(atPath: "/Volumes/\(parts[2])") { return false }
+        return true
     }
 
     static func parse(_ porcelain: String) -> [Worktree] {

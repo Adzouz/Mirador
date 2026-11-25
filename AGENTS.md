@@ -107,7 +107,9 @@ swift test                  # must stay green; add a test for every rule you add
 - `zsh -c` reads `~/.zshenv`, where Volta / nvm put the real `yarn` first in PATH: tests running generated scripts with
   a fake `yarn` use `zsh -f`.
 - Worktrees get removed behind Mirador's back (a terminal, review tooling). Tell "removed" by its `.git` being gone
-  (`Worktrees.isGone`), never by absence from `git worktree list`, which a failing git call also gives.
+  (`Worktrees.isGone`), never by absence from `git worktree list`, which a failing git call also gives. Only ENOENT
+  counts: privacy protection (EPERM after a re-sign) or an unmounted volume also hide `.git`, and "removed" kills the
+  checkout's environment.
 - `Shell.run` is called from cooperative threads (detached tasks, Swift Testing). Anything it waits on must not need
   another thread: a stderr reader on a global queue deadlocked the CI tests once every thread of the 3-core runner's pool
   was in `Shell.run`. It reads both pipes with `poll` on the calling thread and reaps with `waitpid` (no `Process`).

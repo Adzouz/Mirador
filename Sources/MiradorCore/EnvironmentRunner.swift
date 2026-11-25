@@ -39,14 +39,18 @@ public enum EnvironmentRunner {
     /// What a starting environment is busy with: what its start script last wrote, else read from the checkout
     /// (environments started by an older version).
     public static func startupPhase(of path: String, store: Store) -> StartupPhase {
-        if let raw = try? String(contentsOf: stateURL(for: path, "phase", store: store), encoding: .utf8),
-           let phase = StartupPhase(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return phase
-        }
+        if let phase = recordedPhase(of: path, store: store) { return phase }
         let fm = FileManager.default
         if !fm.fileExists(atPath: (path as NSString).appendingPathComponent(installedMarker)) { return .installing }
         if !fm.fileExists(atPath: (path as NSString).appendingPathComponent(builtMarker)) { return .building }
         return .starting
+    }
+
+    /// The phase the last start script wrote. Still installing / building while nothing runs: that start was stopped or
+    /// failed before it finished, and the markers (written by the first package built) cannot be trusted.
+    static func recordedPhase(of path: String, store: Store) -> StartupPhase? {
+        (try? String(contentsOf: stateURL(for: path, "phase", store: store), encoding: .utf8))
+            .flatMap { StartupPhase(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
     // MARK: Preparation
@@ -68,7 +72,13 @@ public enum EnvironmentRunner {
 
     /// Installs and builds what is missing, or what changed since the commit of the last build Mirador ran. `yarn watch`
     /// never builds on start, so commits pulled while an environment was stopped would otherwise run on old `dist` folders.
-    static func preparation(installed: Bool, built: Bool, lastBuilt: String?, head: String?, changes: [String]?) -> Preparation {
+    /// `unfinished`: where the last start stopped before Strapi (stopped, failed, killed by a restart). Its markers come
+    /// from the first files written, so that step is redone in full.
+    static func preparation(installed: Bool, built: Bool, lastBuilt: String?, head: String?, changes: [String]?,
+                            unfinished: StartupPhase? = nil) -> Preparation {
+        if let unfinished, unfinished != .starting {
+            return Preparation(install: !installed || unfinished == .installing, build: .full)
+        }
         var prep = Preparation(install: !installed, build: built ? .none : .full)
         guard let lastBuilt, let head, lastBuilt != head else { return prep }
         // The last build's commit is gone (rewritten, then pruned): nothing tells what changed.
@@ -108,15 +118,19 @@ public enum EnvironmentRunner {
             let diff = Shell.git(["diff", "--name-only", "--no-renames", "-z", lastBuilt, head], in: path)
             if diff.status == 0 { changes = diff.stdout.split(separator: "\0").map(String.init) }
         }
-        let prep = preparation(installed: installed, built: built, lastBuilt: lastBuilt, head: head, changes: changes)
+        // Called once the slot is stopped: a phase still installing / building belongs to a start that never finished.
+        let prep = preparation(installed: installed, built: built, lastBuilt: lastBuilt, head: head, changes: changes,
+                               unfinished: recordedPhase(of: path, store: store))
         return (prep, head)
     }
 
     /// Records the commit the current build was made from, when Mirador has none yet (started by an older version, or
     /// never started): moving HEAD (an update) must leave the next start something to compare with.
+    /// Not while a start is installing or building: that build is not done, whatever its markers say.
     public static func recordBuildIfUnknown(of path: String, at commit: String, store: Store) {
         let url = stateURL(for: path, "built", store: store)
         guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        guard recordedPhase(of: path, store: store).map({ $0 == .starting }) ?? true else { return }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? commit.write(to: url, atomically: true, encoding: .utf8)
     }

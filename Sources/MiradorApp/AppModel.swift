@@ -743,7 +743,7 @@ final class AppModel {
 
     /// Pulls the latest commits of the checkout's branch (or its PR), then restarts its environment if it runs. The
     /// start rebuilds what the pull changed.
-    func updateBranch(_ path: String, replacingLocal: Bool = false) {
+    func updateBranch(_ path: String, replacing: BranchUpdate.Divergence? = nil) {
         guard !updatingBranch.contains(path) else { return }
         updatingBranch.insert(path)
         branchNotes[path] = nil
@@ -751,7 +751,7 @@ final class AppModel {
         let pr = worktrees.first { $0.path == path }.flatMap { primaryTask(for: $0)?.prNumber ?? $0.prNumberFromName }
         let store = store
         Task.detached {
-            let outcome = BranchUpdate.run(at: path, prNumber: pr, replacingLocal: replacingLocal)
+            let outcome = BranchUpdate.run(at: path, prNumber: pr, replacing: replacing)
             if case .updated(let from, _, _) = outcome {
                 EnvironmentRunner.recordBuildIfUnknown(of: path, at: from, store: store)
             }
@@ -774,7 +774,7 @@ final class AppModel {
             }
         case .diverged(let divergence):
             Task { @MainActor in
-                if self.confirmReplace(divergence, at: path) { self.updateBranch(path, replacingLocal: true) }
+                if self.confirmReplace(divergence, at: path) { self.updateBranch(path, replacing: divergence) }
             }
         case .failed(let message):
             showNote(message, for: path, isError: true)

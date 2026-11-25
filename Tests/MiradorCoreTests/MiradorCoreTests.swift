@@ -870,6 +870,12 @@ private func openPR(_ number: Int, branch: String, author: String = "me") throws
     #expect(prep(true, true, "a", "b", nil) == Prep(install: true, build: .full))
     // Never built: a full build whatever changed.
     #expect(prep(true, false, "a", "b", ["packages/core/upload/a.ts"]) == Prep(install: false, build: .full))
+    // The last start stopped before Strapi: its markers say nothing, so that step and the build are redone in full.
+    #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "b", head: "b", changes: nil, unfinished: .building)
+        == Prep(install: false, build: .full))
+    #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "b", head: "b", changes: nil, unfinished: .installing)
+        == Prep(install: true, build: .full))
+    #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "b", head: "b", changes: nil, unfinished: .starting) == Prep())
 }
 
 /// Runs the generated scripts with a fake `yarn` that logs its arguments.
@@ -953,6 +959,15 @@ private func openPR(_ number: Int, branch: String, author: String = "me") throws
     // A recorded commit that no longer exists: everything again.
     try "0123456789abcdef0123456789abcdef01234567".write(to: EnvironmentRunner.stateURL(for: repo.path, "built", store: store), atomically: true, encoding: .utf8)
     #expect(EnvironmentRunner.preparation(for: repo.path, store: store).0 == .init(install: true, build: .full))
+
+    // A first build stopped halfway (by an update's restart): its markers exist, but nothing is recorded as built and
+    // the next start builds everything.
+    let built = EnvironmentRunner.stateURL(for: repo.path, "built", store: store)
+    try FileManager.default.removeItem(at: built)
+    try "building".write(to: EnvironmentRunner.stateURL(for: repo.path, "phase", store: store), atomically: true, encoding: .utf8)
+    EnvironmentRunner.recordBuildIfUnknown(of: repo.path, at: base, store: store)
+    #expect(!FileManager.default.fileExists(atPath: built.path))
+    #expect(EnvironmentRunner.preparation(for: repo.path, store: store).0 == .init(install: false, build: .full))
 }
 
 // MARK: Branch update
@@ -1148,9 +1163,55 @@ private struct Remote {
 
     // Confirmed: follows the remote; the uncommitted file stays.
     try write("draft\n", to: r.work, "notes.txt")
-    guard case .updated = BranchUpdate.run(at: r.work.path, replacingLocal: true) else { Issue.record("expected updated"); return }
+    guard case .updated = BranchUpdate.run(at: r.work.path, replacing: d) else { Issue.record("expected updated"); return }
     #expect(r.head(r.work) == r.head(r.other))
     #expect(FileManager.default.fileExists(atPath: r.work.appendingPathComponent("notes.txt").path))
+}
+
+@Test func aConfirmationCoversOnlyTheCommitsItShowed() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    try write("mine\n", to: r.work, "b.txt")
+    r.commit(r.work, "local work")
+    try write("one\ntwo\nthree\n", to: r.other, "a.txt")
+    r.commit(r.other, "third")
+    gitIn(r.other)(["push", "-q", "origin", "main"])
+    guard case .diverged(let shown) = BranchUpdate.run(at: r.work.path) else { Issue.record("expected diverged"); return }
+
+    // A commit made while the dialog was open: the confirmation does not cover it, so the user is asked again.
+    try write("more\n", to: r.work, "c.txt")
+    r.commit(r.work, "more local work")
+    let local = r.head(r.work)
+    guard case .diverged(let again) = BranchUpdate.run(at: r.work.path, replacing: shown) else { Issue.record("expected diverged"); return }
+    #expect(again.commits == 2 && again.head == local)
+    #expect(r.head(r.work) == local)
+
+    // Same when the remote moved again.
+    try write("one\ntwo\nthree\nfour\n", to: r.other, "a.txt")
+    r.commit(r.other, "fourth")
+    gitIn(r.other)(["push", "-q", "origin", "main"])
+    guard case .diverged(let newer) = BranchUpdate.run(at: r.work.path, replacing: again) else { Issue.record("expected diverged"); return }
+    #expect(newer.latest == r.head(r.other) && r.head(r.work) == local)
+}
+
+@Test func updateWaitsForARebaseOrBisectToFinish() throws {
+    let r = try Remote()
+    defer { r.cleanUp() }
+    gitIn(r.work)(["bisect", "start"])
+    let before = r.head(r.work)
+    #expect(BranchUpdate.run(at: r.work.path) == .failed("A bisect is in progress in this checkout. Finish or abort it, then update again."))
+    gitIn(r.work)(["bisect", "reset", "-q"])
+
+    // Stopped on an "edit" step: HEAD is detached, and the PR ref would otherwise fast-forward it.
+    try write("x\n", to: r.work, "x.txt")
+    r.commit(r.work, "x")
+    try write("y\n", to: r.work, "y.txt")
+    r.commit(r.work, "y")
+    gitIn(r.work)(["-c", "sequence.editor=sed -i '' '1s/^pick/edit/'", "rebase", "-q", "-i", "HEAD~2"])
+    let stopped = r.head(r.work)
+    #expect(stopped != before)
+    #expect(BranchUpdate.run(at: r.work.path, prNumber: 7) == .failed("A rebase is in progress in this checkout. Finish or abort it, then update again."))
+    #expect(r.head(r.work) == stopped)
 }
 
 @Test func updateNeverOverwritesUncommittedChanges() throws {
@@ -1373,6 +1434,47 @@ private struct Remote {
     #expect(Worktrees.resolved(path) == before)
     #expect(Worktrees.isGone(path))
     #expect(Worktrees.resolved("relative/missing") == "relative/missing")
+}
+
+/// Only "no such file" means removed: a folder Mirador may not read, or a volume that is not mounted, says nothing.
+@Test func checkoutsMiradorCannotSeeAreNotGone() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let locked = root.appendingPathComponent("locked")
+    let checkout = locked.appendingPathComponent("pr-1")
+    try FileManager.default.createDirectory(at: checkout.appendingPathComponent(".git"), withIntermediateDirectories: true)
+    #expect(!Worktrees.isGone(checkout.path))
+
+    chmod(locked.path, 0)
+    #expect(!Worktrees.isGone(checkout.path))
+    chmod(locked.path, 0o755)
+    #expect(!Worktrees.isGone("/Volumes/mirador-not-mounted-\(UUID().uuidString)/wt/pr-1"))
+
+    try FileManager.default.removeItem(at: checkout)
+    #expect(Worktrees.isGone(checkout.path))
+}
+
+/// git keeps listing a locked worktree whose folder was deleted: listed, it came back every time it was forgotten.
+@Test func lockedWorktreesWhoseFolderIsGoneAreNotListed() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo")
+    let worktree = root.appendingPathComponent("wt/pr-1")
+    try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+    let git = gitIn(repo)
+    git(["init", "-q", "-b", "main"])
+    try write("x", to: repo, "a.txt")
+    git(["add", "-A"]); git(["commit", "-qm", "base"])
+    git(["worktree", "add", "-q", "--lock", "--detach", worktree.path])
+    var settings = AppSettings()
+    settings.repoPath = repo.path
+    settings.worktreesPath = root.appendingPathComponent("wt").path
+    #expect(Worktrees.list(settings: settings).contains { Worktrees.samePath($0.path, worktree.path) })
+
+    try FileManager.default.removeItem(at: worktree)
+    let list = Worktrees.list(settings: settings)
+    #expect(!list.contains { Worktrees.samePath($0.path, worktree.path) })
+    #expect(list.contains { $0.isMain })
 }
 
 /// `mirador env start .` used to store ".", which the app (running from `/`) took for a removed checkout.
