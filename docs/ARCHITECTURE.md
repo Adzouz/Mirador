@@ -62,12 +62,13 @@ folders>` (what `yarn watch` runs on a change); shared build setup (root `packag
 `rollup.utils.mjs`) → full `yarn build`. No record yet → the build is assumed to match HEAD (the old behaviour). The
 start script writes its phase to `<folder>-<hash>.phase`: the app shows it while starting, `yarn watch` waits for
 `starting`. A phase still `installing` / `building` at the next start means that start stopped before Strapi (stopped,
-failed, or killed by a restart): the markers come from the first files written, so it installs (if it was installing)
-and builds in full, and nothing records a build for it meanwhile.
+failed, or killed by a restart): the markers come from the first files written, so it builds in full and installs if it
+was installing (or if dependencies changed since the last build), and nothing records a build for it meanwhile.
 
 **Removed checkouts.** A checkout is gone once its `.git` is (`Worktrees.isGone`: "no such file", never a lookup the
-system refused or a volume that is not mounted), never because `git worktree list` omits it (a failing git call omits
-everything). `Worktrees.list` leaves out listed worktrees that are gone (git keeps listing a locked one). Every 2 s,
+system refused or a volume that is not mounted, symlinks to it included), never because `git worktree list` omits it (a
+failing git call omits everything). `Worktrees.list` leaves out listed worktrees that are gone (git keeps listing a
+locked one), except for Cleanup and worktree creation (`includingRemoved`): it still holds its branch. Every 2 s,
 with the environment poll, the app checks the worktrees it lists, the running environments and the tasks' worktree links
 (file checks only), and the modification dates of the worktrees folder and `.git/worktrees` (any change refreshes the
 list). A removal drops the worktree from every list at once; `EnvironmentRunner.forgetRemovedCheckouts` forgets its

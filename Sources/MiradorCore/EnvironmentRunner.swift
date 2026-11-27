@@ -76,10 +76,11 @@ public enum EnvironmentRunner {
     /// from the first files written, so that step is redone in full.
     static func preparation(installed: Bool, built: Bool, lastBuilt: String?, head: String?, changes: [String]?,
                             unfinished: StartupPhase? = nil) -> Preparation {
-        if let unfinished, unfinished != .starting {
-            return Preparation(install: !installed || unfinished == .installing, build: .full)
-        }
         var prep = Preparation(install: !installed, build: built ? .none : .full)
+        if let unfinished, unfinished != .starting {
+            prep.build = .full
+            if unfinished == .installing { prep.install = true }
+        }
         guard let lastBuilt, let head, lastBuilt != head else { return prep }
         // The last build's commit is gone (rewritten, then pruned): nothing tells what changed.
         guard let changes else { return Preparation(install: true, build: .full) }

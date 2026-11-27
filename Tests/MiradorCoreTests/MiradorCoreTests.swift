@@ -876,6 +876,13 @@ private func openPR(_ number: Int, branch: String, author: String = "me") throws
     #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "b", head: "b", changes: nil, unfinished: .installing)
         == Prep(install: true, build: .full))
     #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "b", head: "b", changes: nil, unfinished: .starting) == Prep())
+    // …and what changed since the last build still counts: new dependencies, or no way to tell.
+    #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "a", head: "b", changes: ["yarn.lock"], unfinished: .building)
+        == Prep(install: true, build: .full))
+    #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "a", head: "b", changes: nil, unfinished: .building)
+        == Prep(install: true, build: .full))
+    #expect(EnvironmentRunner.preparation(installed: true, built: true, lastBuilt: "a", head: "b", changes: ["docs/a.md"], unfinished: .building)
+        == Prep(install: false, build: .full))
 }
 
 /// Runs the generated scripts with a fake `yarn` that logs its arguments.
@@ -1347,8 +1354,10 @@ private struct Remote {
     let ours = try EnvironmentRunner.spawn("exec sleep 60", cwd: removed, log: log)
     let someoneElse = try EnvironmentRunner.spawn("exec sleep 60", cwd: reused, log: log)
     defer {
-        kill(-someoneElse, SIGKILL)
-        _ = waitpid(someoneElse, nil, 0)
+        for group in [ours, someoneElse] {
+            kill(-group, SIGKILL)
+            _ = waitpid(group, nil, 0)
+        }
     }
     store.update { data in
         data.runningEnvironments = [
@@ -1448,7 +1457,15 @@ private struct Remote {
     chmod(locked.path, 0)
     #expect(!Worktrees.isGone(checkout.path))
     chmod(locked.path, 0o755)
-    #expect(!Worktrees.isGone("/Volumes/mirador-not-mounted-\(UUID().uuidString)/wt/pr-1"))
+    let unplugged = "/Volumes/mirador-not-mounted-\(UUID().uuidString)"
+    #expect(!Worktrees.isGone(unplugged + "/wt/pr-1"))
+    // The worktrees folder setting is a symlink to the drive.
+    let link = root.appendingPathComponent("wt")
+    try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: unplugged + "/wt")
+    #expect(Worktrees.physicalPath(link.path + "/pr-1") == unplugged + "/wt/pr-1")
+    #expect(!Worktrees.isGone(link.path + "/pr-1"))
+    try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("up").path, withDestinationPath: "locked/../locked")
+    #expect(Worktrees.physicalPath(root.appendingPathComponent("up/pr-1").path) == Worktrees.physicalPath(checkout.path))
 
     try FileManager.default.removeItem(at: checkout)
     #expect(Worktrees.isGone(checkout.path))
@@ -1475,6 +1492,31 @@ private struct Remote {
     let list = Worktrees.list(settings: settings)
     #expect(!list.contains { Worktrees.samePath($0.path, worktree.path) })
     #expect(list.contains { $0.isMain })
+    // Cleanup and worktree creation still see it: it holds its branch until git removes it.
+    #expect(Worktrees.list(settings: settings, includingRemoved: true).contains { Worktrees.samePath($0.path, worktree.path) })
+}
+
+/// A deleted but locked worktree still holds its branch: a new worktree for it must check out detached.
+@Test func aDeletedLockedWorktreeStillHoldsItsBranch() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("mirador-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let repo = root.appendingPathComponent("repo")
+    let worktree = root.appendingPathComponent("wt/pr-1")
+    try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+    let git = gitIn(repo)
+    git(["init", "-q", "-b", "main"])
+    try write("x", to: repo, "a.txt")
+    git(["add", "-A"]); git(["commit", "-qm", "base"])
+    git(["worktree", "add", "-q", "--lock", "-b", "fix/thing", worktree.path])
+    var settings = AppSettings()
+    settings.repoPath = repo.path
+    settings.worktreesPath = root.appendingPathComponent("wt").path
+    try FileManager.default.removeItem(at: worktree)
+
+    #expect(WorktreeCreator.holder(of: "fix/thing", settings: settings).map { Worktrees.samePath($0.path, worktree.path) } == true)
+    #expect(WorktreeCreator.holder(of: "main", settings: settings)?.isMain == true)
+    #expect(WorktreeCreator.holder(of: "other", settings: settings) == nil)
+    #expect(WorktreeCreator.holder(of: nil, settings: settings) == nil)
 }
 
 /// `mirador env start .` used to store ".", which the app (running from `/`) took for a removed checkout.

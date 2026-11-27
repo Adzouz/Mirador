@@ -41,6 +41,13 @@ public enum WorktreeCreator {
         return r.stdout
     }
 
+    /// The checkout holding a branch: git refuses it to any other (often the monorepo itself). A deleted but locked
+    /// worktree still holds its branch.
+    static func holder(of branch: String?, settings: AppSettings) -> Worktree? {
+        guard let branch else { return nil }
+        return Worktrees.list(settings: settings, includingRemoved: true).first { $0.branch == branch }
+    }
+
     /// Returns the new worktree path and its branch.
     public static func create(for task: TrackedTask, settings: AppSettings) throws -> (path: String, branch: String?) {
         let repo = (settings.repoPath as NSString).standardizingPath
@@ -49,8 +56,7 @@ public enum WorktreeCreator {
         let path = (folder as NSString).appendingPathComponent(folderName(for: task))
         guard !FileManager.default.fileExists(atPath: path) else { throw CreateError.exists(path) }
 
-        // git refuses a branch already checked out elsewhere (often the monorepo itself).
-        let holder = task.branch.flatMap { branch in Worktrees.list(settings: settings).first { $0.branch == branch } }
+        let holder = holder(of: task.branch, settings: settings)
 
         try git(["fetch", "--quiet", "origin", "develop"], in: repo)
 

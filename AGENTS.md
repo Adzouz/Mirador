@@ -108,8 +108,9 @@ swift test                  # must stay green; add a test for every rule you add
   a fake `yarn` use `zsh -f`.
 - Worktrees get removed behind Mirador's back (a terminal, review tooling). Tell "removed" by its `.git` being gone
   (`Worktrees.isGone`), never by absence from `git worktree list`, which a failing git call also gives. Only ENOENT
-  counts: privacy protection (EPERM after a re-sign) or an unmounted volume also hide `.git`, and "removed" kills the
-  checkout's environment.
+  counts: privacy protection (EPERM after a re-sign) or an unmounted volume (also behind a symlink such as `~/wt`)
+  also hide `.git`, and "removed" kills the checkout's environment. A deleted but locked worktree still holds its
+  branch for git: Cleanup and `WorktreeCreator` list it (`includingRemoved`).
 - `Shell.run` is called from cooperative threads (detached tasks, Swift Testing). Anything it waits on must not need
   another thread: a stderr reader on a global queue deadlocked the CI tests once every thread of the 3-core runner's pool
   was in `Shell.run`. It reads both pipes with `poll` on the calling thread and reaps with `waitpid` (no `Process`).
