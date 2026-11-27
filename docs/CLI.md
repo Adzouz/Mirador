@@ -24,9 +24,9 @@ Without one, the task is found from the current directory (its worktree, then it
 | Command | What it does |
 | --- | --- |
 | `mirador worktree <ref> [--dir D]` | Create a worktree in the worktrees folder: `gh pr checkout` for a PR (forks included), a new branch from `origin/develop` for a ticket. |
-| `mirador env start [path]` | Run `yarn watch` + `yarn develop --watch-admin` (installs and builds first if needed). The monorepo and one worktree can run side by side. |
+| `mirador env start [path]` | Run `yarn watch` + `yarn develop --watch-admin`. Installs and builds first what is missing, or what changed since its last start (after a pull, for instance). The monorepo and one worktree can run side by side. |
 | `mirador env stop [path] [--all]` | Stop one environment, or all. |
-| `mirador env status` | What runs, where, on which port. |
+| `mirador env status` | What runs, where, on which port. Environments of removed worktrees are forgotten first. |
 | `mirador admin [path] [--port N] [--email E]` | Create the super admin configured in Settings on a running app that has none. `MIRADOR_ADMIN_PASSWORD` overrides the Keychain password. |
 
 ## Other

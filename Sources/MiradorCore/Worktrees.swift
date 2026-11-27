@@ -24,11 +24,14 @@ public enum Worktrees {
     public static let defaultRepo = AppSettings().repoPath
 
     /// Worktrees git knows about, plus any checkout sitting in the worktrees folder.
-    public static func list(settings: AppSettings = AppSettings()) -> [Worktree] {
+    /// git keeps listing a locked worktree whose folder was deleted: left out, unless `includingRemoved` (it still holds
+    /// its branch, and only git can remove it), so a forgotten one does not come straight back.
+    public static func list(settings: AppSettings = AppSettings(), includingRemoved: Bool = false) -> [Worktree] {
         let repo = (settings.repoPath as NSString).standardizingPath
-        let result = Shell.run("git", ["-C", repo, "worktree", "list", "--porcelain"])
+        let result = Shell.git(["worktree", "list", "--porcelain"], in: repo)
         var items = result.status == 0 ? parse(result.stdout) : []
         for i in items.indices { items[i].isMain = samePath(items[i].path, repo) }
+        if !includingRemoved { items.removeAll { !$0.isMain && isGone($0.path) } }
         let known = Set(items.map { resolved($0.path) })
         let folder = (settings.worktreesPath as NSString).standardizingPath
         let children = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
@@ -36,18 +39,73 @@ public enum Worktrees {
             let path = (folder as NSString).appendingPathComponent(name)
             guard !known.contains(resolved(path)),
                   FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent(".git")) else { continue }
-            let head = Shell.run("git", ["-C", path, "rev-parse", "HEAD"]).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            let head = Shell.git(["rev-parse", "HEAD"], in: path).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             items.append(Worktree(path: path, branch: currentBranch(at: path), head: head, isMain: false))
         }
         return items
     }
 
-    /// Paths as the file system sees them: git prints real paths, Settings may hold a symlink.
+    /// Paths as the file system sees them: git prints real paths, Settings may hold a symlink. A path that no longer
+    /// exists resolves through its deepest existing folder, so it keeps the form it had before it was removed.
     public static func resolved(_ path: String) -> String {
-        URL(fileURLWithPath: (path as NSString).standardizingPath).resolvingSymlinksInPath().path
+        let standard = (path as NSString).standardizingPath
+        var existing = standard
+        var missing: [String] = []
+        while !FileManager.default.fileExists(atPath: existing) {
+            let parent = (existing as NSString).deletingLastPathComponent
+            guard !parent.isEmpty, parent != existing else { return standard }
+            missing.insert((existing as NSString).lastPathComponent, at: 0)
+            existing = parent
+        }
+        let base = URL(fileURLWithPath: existing).resolvingSymlinksInPath().path
+        return missing.reduce(base) { ($0 as NSString).appendingPathComponent($1) }
     }
 
     public static func samePath(_ a: String, _ b: String) -> Bool { resolved(a) == resolved(b) }
+
+    /// Removed for good: its `.git` went with the folder (`git worktree remove`, `rm`, Cleanup). Never "missing from
+    /// `git worktree list`", which a failing git command would also give. A relative path says nothing: it depends on
+    /// who reads it (the app runs from `/`).
+    /// Only "no such file" counts: a lookup refused (privacy protection after a re-sign, permissions) or a volume that is
+    /// not mounted says nothing, and treating it as removed would stop running environments.
+    public static func isGone(_ path: String) -> Bool {
+        guard (path as NSString).isAbsolutePath else { return false }
+        var info = stat()
+        guard lstat((path as NSString).appendingPathComponent(".git"), &info) != 0 else { return false }
+        guard errno == ENOENT || errno == ENOTDIR else { return false }
+        return !isOnMissingVolume(path)
+    }
+
+    /// Under `/Volumes/<name>`, also through symlinks (`~/wt` → an external drive), while nothing is mounted there.
+    static func isOnMissingVolume(_ path: String) -> Bool {
+        let parts = (physicalPath(path) as NSString).pathComponents
+        guard parts.count > 2, parts[0] == "/", parts[1] == "Volumes" else { return false }
+        var volume = stat(), volumes = stat()
+        // An unmounted volume can leave an empty folder behind: mounted means on another device than `/Volumes`.
+        guard stat("/Volumes/\(parts[2])", &volume) == 0, stat("/Volumes", &volumes) == 0 else { return true }
+        return volume.st_dev == volumes.st_dev
+    }
+
+    /// The path with every symlink in it followed, even when what it points to is missing (an unplugged drive).
+    static func physicalPath(_ path: String) -> String {
+        var remaining = Array((path as NSString).pathComponents.dropFirst())
+        var current = "/"
+        var links = 0
+        while !remaining.isEmpty {
+            let name = remaining.removeFirst()
+            if name == "." || name == "/" { continue }
+            if name == ".." { current = (current as NSString).deletingLastPathComponent; continue }
+            let next = (current as NSString).appendingPathComponent(name)
+            guard links < 32, let target = try? FileManager.default.destinationOfSymbolicLink(atPath: next) else {
+                current = next
+                continue
+            }
+            links += 1
+            if (target as NSString).isAbsolutePath { current = "/" }
+            remaining = (target as NSString).pathComponents.filter { $0 != "/" } + remaining
+        }
+        return current
+    }
 
     static func parse(_ porcelain: String) -> [Worktree] {
         var items: [Worktree] = []
@@ -87,15 +145,36 @@ public enum Worktrees {
     }
 
     public static func currentBranch(at path: String) -> String? {
-        let r = Shell.run("git", ["-C", path, "rev-parse", "--abbrev-ref", "HEAD"])
+        let r = Shell.git(["rev-parse", "--abbrev-ref", "HEAD"], in: path)
         let branch = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return r.status == 0 && branch != "HEAD" && !branch.isEmpty ? branch : nil
     }
 
     public static func topLevel(at path: String) -> String? {
-        let r = Shell.run("git", ["-C", path, "rev-parse", "--show-toplevel"])
+        let r = Shell.git(["rev-parse", "--show-toplevel"], in: path)
         let top = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return r.status == 0 && !top.isEmpty ? top : nil
+    }
+
+    /// A checkout typed on the command line (`.`, `../pr-2`, `~/wt/x`), as the app must store it: absolute (the app
+    /// runs from `/`) and at the checkout's top level when it is one.
+    public static func checkoutPath(_ argument: String, cwd: String) -> String {
+        let expanded = (argument as NSString).expandingTildeInPath
+        let absolute = (expanded as NSString).isAbsolutePath ? expanded : (cwd as NSString).appendingPathComponent(expanded)
+        let standard = (absolute as NSString).standardizingPath
+        return topLevel(at: standard) ?? standard
+    }
+}
+
+public extension StoreData {
+    /// Forgets checkouts that were removed: tasks stop pointing at them and their environments leave the list.
+    /// Returns those environments, whose leftover processes the caller stops.
+    @discardableResult
+    mutating func forgetCheckouts(_ paths: Set<String>) -> [RunningEnvironment] {
+        let dropped = runningEnvironments.filter { paths.contains($0.worktreePath) }
+        runningEnvironments.removeAll { paths.contains($0.worktreePath) }
+        for i in tasks.indices where tasks[i].worktreePath.map(paths.contains) == true { tasks[i].worktreePath = nil }
+        return dropped
     }
 }
 
@@ -108,7 +187,7 @@ public enum LocalWork {
     }
 
     static func lastCheckout(_ path: String) -> Date? {
-        let r = Shell.run("git", ["-C", path, "log", "-g", "-1", "--format=%ct"])
+        let r = Shell.git(["log", "-g", "-1", "--format=%ct"], in: path)
         return TimeInterval(r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)).map(Date.init(timeIntervalSince1970:))
     }
 

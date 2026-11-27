@@ -48,7 +48,8 @@ These come from the maintainer's feedback; keep them when adding features.
 | Pings (review requests, mentions, re-reviews, red CI, Linear) | `Pings.swift`, PingsView in `MainView.swift` | Search by `#PR`, `@user`, words; mark read; bulk delete. |
 | Links (PR, GitHub issue, Linear ticket per task; merge on conflict; unlink sticks) | `Links.swift`, `AddTaskSheet.swift` (link mode), `TaskDetailView.swift` header | One of each type per task. |
 | **Auto-archive + History** | `Archive.swift` | Merged / closed PRs, PR-less tickets done in Linear, PR-less ticket-less closed issues. Unarchive sticks until the status changes. |
-| Worktrees per task, Quickstart (monorepo + one worktree side by side) | `Worktrees.swift`, `WorktreeCreator.swift`, `EnvironmentRunner.swift`, `EnvironmentsView.swift` | A task never resolves to the monorepo checkout. |
+| Worktrees per task, Quickstart (monorepo + one worktree side by side) | `Worktrees.swift`, `WorktreeCreator.swift`, `EnvironmentRunner.swift`, `EnvironmentsView.swift` | A task never resolves to the monorepo checkout. Starts rebuild only what changed since the last build. Worktrees removed outside Mirador leave every list within seconds, with their environment and task links. |
+| **Update branch** (pull a worktree's new commits, restart it) | `BranchUpdate.swift`, `UpdateBranchButton` in `Components.swift`, `AppModel.updateBranch` | Worktrees only. A force-push is followed when nothing local is lost; otherwise the app asks. |
 | Cleanup of merged / closed branches and worktrees | `Cleanup.swift`, `CleanupView.swift` | Local scan first, then GitHub. |
 | Menu bar panel | `MenuBarView.swift` | Shows only the focus card in focus mode. |
 | CLI + Claude Code skill | `Sources/mirador/main.swift`, `AgentGuide.swift` | See [docs/CLI.md](docs/CLI.md), [docs/AGENTS_INTEGRATION.md](docs/AGENTS_INTEGRATION.md). |
@@ -68,6 +69,7 @@ These come from the maintainer's feedback; keep them when adding features.
 | What | Where |
 | --- | --- |
 | Tasks, pings, settings, running environments | `~/Library/Application Support/Mirador/store.json` |
+| Per checkout: start phase, commit of the last build | `~/Library/Application Support/Mirador/environments/` |
 | UI state (sidebar section, focus mode, skipped stack, sort / filters) | UserDefaults domain `dev.mirador.app` |
 | Secrets (Linear key, admin password) | Keychain service `dev.mirador.app` |
 | Sync log, environment logs | `~/Library/Logs/Mirador/` |
@@ -85,7 +87,9 @@ There is no UI test target and no accessibility permission for scripted clicks. 
    `screencapture -l <windowID>`, shrink with `sips -Z 1400`, and look at it.
 3. Put behaviour in Core and test it there; say plainly which clicks were not tried in the app.
 
-The menu bar panel cannot be opened from a script.
+The menu bar panel cannot be opened from a script. To reach a screen without clicking: quit the app, set
+`defaults write dev.mirador.app sidebarSection Environments` (or a task's UUID in `lastSelection`), relaunch, and put
+the previous values back afterwards.
 
 ## Current state
 
@@ -100,3 +104,4 @@ Only build these when asked.
 
 - Cut v0.2.0 once PR #1 is merged.
 - Refresh README screenshots.
+- Update branch for the monorepo checkout (`BranchUpdate` already works on any checkout; the button is hidden there).

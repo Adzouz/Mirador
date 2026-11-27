@@ -219,7 +219,7 @@ case "sync":
 
 case "env":
     let sub = args.positional.first ?? "status"
-    let path = args.positional.dropFirst().first.map { ($0 as NSString).standardizingPath } ?? Worktrees.topLevel(at: cwd)
+    let path = args.positional.dropFirst().first.map { Worktrees.checkoutPath($0, cwd: cwd) } ?? Worktrees.topLevel(at: cwd)
     let settings = store.load().settings
     switch sub {
     case "start":
@@ -234,6 +234,7 @@ case "env":
         if args.flags.contains("all") || path == nil { EnvironmentRunner.stopAll(store: store) } else { EnvironmentRunner.stop(path: path!, store: store) }
         print("Stopped.")
     default:
+        EnvironmentRunner.forgetRemovedCheckouts(store: store)
         let envs = store.load().runningEnvironments
         if envs.isEmpty { print("No environment running.") }
         for env in envs {
@@ -281,7 +282,7 @@ case "cleanup":
 case "admin":
     // Create the configured super admin on a running app that has none yet.
     let settings = store.load().settings
-    let path = args.positional.first.map { ($0 as NSString).standardizingPath } ?? Worktrees.topLevel(at: cwd)
+    let path = args.positional.first.map { Worktrees.checkoutPath($0, cwd: cwd) } ?? Worktrees.topLevel(at: cwd)
     guard let port = args.options["port"].flatMap(Int.init) ?? path.map(settings.port(for:)) else { fail("usage: mirador admin [path] [--port N]") }
     let email = args.options["email"] ?? settings.adminEmail
     guard !email.isEmpty else { fail("set the admin email in Settings (or pass --email)") }

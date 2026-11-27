@@ -218,14 +218,16 @@ struct MenuEnvironmentCard: View {
                     .menuStyle(.button)
                     .buttonStyle(ShadButtonStyle(variant: .outline, size: .md))
                     .menuIndicator(.visible)
+                    UpdateBranchButton(path: selected.path, compact: true)
                     Button {
                         model.startEnvironment(selected.path)
                     } label: {
                         Label("Quickstart", systemImage: "play.fill")
                     }
                     .shadButton(.primary, size: .md)
-                    .disabled(model.busyEnvironment != nil)
+                    .disabled(model.busyEnvironment != nil || model.updatingBranch.contains(selected.path))
                 }
+                BranchNoteText(path: selected.path)
                 if let other = model.slotConflict(for: selected.path) {
                     Muted("Stops \((other.worktreePath as NSString).lastPathComponent) (same :\(String(model.port(for: selected.path))) slot).", size: 11)
                 }
@@ -246,7 +248,12 @@ struct RunningEnvironmentBlock: View {
                 Text(model.environmentTitle(for: path))
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(2)
+                if !model.isMonorepo(path) {
+                    Spacer(minLength: 4)
+                    UpdateBranchButton(path: path, compact: true)
+                }
             }
+            BranchNoteText(path: path)
             HStack(spacing: 6) {
                 Image(systemName: "folder").imageScale(.small).foregroundStyle(Theme.mutedForeground)
                 Text(path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))

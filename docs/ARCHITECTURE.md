@@ -51,12 +51,48 @@ Each source fails independently; errors go to the toolbar and `~/Library/Logs/Mi
 `EnvironmentRunner` starts two processes per checkout, each in its own process group, logging to
 `~/Library/Logs/Mirador/<folder>-{watch,develop}.log`:
 
-- `yarn watch` (waits until the first build exists)
-- `yarn install` if needed → `yarn build` if needed → `cd <app> && PORT=<port> yarn develop --watch-admin`
+- install / build if needed → `cd <app> && PORT=<port> yarn develop --watch-admin`
+- `yarn watch`, once install and build are done (it rebuilds on changes, never on start)
+
+"If needed" (`EnvironmentRunner.preparation`): missing install / build markers (fresh checkout: `yarn install`, full
+`yarn build`), or what changed since the commit of the last build Mirador ran, recorded per checkout in
+`~/Library/Application Support/Mirador/environments/<folder>-<hash>.built`. A changed `package.json` or lockfile →
+`yarn install`; changed files under `packages/` → `nx run-many --targets build:code,build:types --projects <their
+folders>` (what `yarn watch` runs on a change); shared build setup (root `package.json`, `yarn.lock`, `nx.json`,
+`rollup.utils.mjs`) → full `yarn build`. No record yet → the build is assumed to match HEAD (the old behaviour). The
+start script writes its phase to `<folder>-<hash>.phase`: the app shows it while starting, `yarn watch` waits for
+`starting`. A phase still `installing` / `building` at the next start means that start stopped before Strapi (stopped,
+failed, or killed by a restart): the markers come from the first files written, so it builds in full and installs if it
+was installing (or if dependencies changed since the last build), and nothing records a build for it meanwhile.
+
+**Removed checkouts.** A checkout is gone once its `.git` is (`Worktrees.isGone`: "no such file", never a lookup the
+system refused or a volume that is not mounted, symlinks to it included), never because `git worktree list` omits it (a
+failing git call omits everything). `Worktrees.list` leaves out listed worktrees that are gone (git keeps listing a
+locked one), except for Cleanup and worktree creation (`includingRemoved`): it still holds its branch. Every 2 s,
+with the environment poll, the app checks the worktrees it lists, the running environments and the tasks' worktree links
+(file checks only), and the modification dates of the worktrees folder and `.git/worktrees` (any change refreshes the
+list). A removal drops the worktree from every list at once; `EnvironmentRunner.forgetRemovedCheckouts` forgets its
+environment, unlinks its tasks (the sync matches them again) and deletes its phase / build records. Leftover processes
+are stopped only when their group is still led by the process Mirador started (`isOurs`, by start time): recorded ids
+get reused. The sync, every start and `mirador env status` do the same for removals made while the app was closed.
 
 A task's environment is `Worktrees.resolve`: its linked worktree, else the best match by branch / `pr-<n>` folder /
 Linear key, **never the monorepo checkout** (shared, switches branches). Two slots: the monorepo and one worktree, each on its port from Settings. Starting a checkout stops only what runs in
-its slot. State = process groups alive + port answering; startup phase is read from install / build markers.
+its slot. State = process groups alive + port answering; startup phase is read from the phase file (install / build
+markers for environments started by an older version).
+
+**Update branch** (worktrees; `BranchUpdate`): fetches what the checkout follows (its upstream, else
+`refs/pull/<n>/head` for a detached PR checkout, else the same branch name on strapi/strapi) and fast-forwards. A
+force-pushed branch (commits reworded or only dropped) is followed (`reset --keep`) only when HEAD was that remote
+branch at some point (`merge-base --fork-point` over the remote-tracking ref's reflog) and none of the commits it drops
+were written or committed by the local git user (a pushed commit of theirs is in that reflog too); otherwise the app
+asks, saying how many commits would be dropped and whose. Commits on top of the new version count as not pushed yet ("up
+to date") only when none of them was ever on the remote branch; with no remote-tracking ref (a detached PR or a fork
+checkout) nothing shows that, so the app asks. Confirming covers only the commits the dialog counted: if the checkout or
+the remote moved meanwhile, the app asks again. Uncommitted changes are never overwritten, a checkout whose HEAD moved
+during the fetch is left alone, and nothing moves during a rebase, merge, cherry-pick, revert or bisect. The app then
+restarts the environment if it runs, and the start rebuilds what the pull changed. With no record yet, the commit from
+before the update is recorded as the built one, so that start still sees the change.
 When an environment reaches Running and the super admin option is on, `AdminBootstrap` calls
 `GET /admin/init` and, if there is no admin, `POST /admin/register-admin`.
 

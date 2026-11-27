@@ -141,7 +141,7 @@ struct EnvironmentControls: View {
 
     var body: some View {
         let state = model.state(of: path)
-        let busy = model.busyEnvironment != nil
+        let busy = model.busyEnvironment != nil || model.updatingBranch.contains(path)
         HStack(spacing: 8) {
             EnvironmentBadge(state: state, detail: state == .starting ? model.startDetails[path] : nil)
             Muted(":\(String(model.port(for: path)))")
@@ -183,6 +183,65 @@ extension EnvironmentControls {
         }
         if !model.isMonorepo(path) { text += " The monorepo can keep running next to it." }
         return text
+    }
+}
+
+/// Pulls the latest commits of a worktree's branch (or its PR) and restarts its environment when it runs.
+struct UpdateBranchButton: View {
+    @Environment(AppModel.self) private var model
+    let path: String
+    /// Icon only: the container shows `BranchNoteText` where it has room.
+    var compact = false
+
+    var body: some View {
+        let updating = model.updatingBranch.contains(path)
+        HStack(spacing: 8) {
+            if !compact {
+                BranchNoteText(path: path)
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: 240, alignment: .trailing)
+            }
+            Button { model.updateBranch(path) } label: {
+                if compact {
+                    icon(updating)
+                } else {
+                    Label { Text(updating ? "Updating…" : "Update branch") } icon: { icon(updating) }
+                }
+            }
+            .buttonStyle(ShadButtonStyle(variant: compact ? .ghost : .outline, size: compact ? .icon : .sm))
+            .fixedSize()
+            .disabled(updating || model.busyEnvironment == path)
+            .help(help)
+            .accessibilityLabel("Update branch")
+        }
+    }
+
+    @ViewBuilder
+    private func icon(_ updating: Bool) -> some View {
+        if updating { ProgressView().controlSize(.mini) } else { Image(systemName: "arrow.down.circle") }
+    }
+
+    private var help: String {
+        let what = model.worktrees.first { $0.path == path }?.branch.map { "Pull the latest commits of \($0)" } ?? "Pull the PR's latest commits"
+        return model.running.contains { $0.worktreePath == path }
+            ? "\(what) and restart. Only what changed is rebuilt."
+            : "\(what). The next start rebuilds only what changed."
+    }
+}
+
+/// "Already up to date", or why an update failed.
+struct BranchNoteText: View {
+    @Environment(AppModel.self) private var model
+    let path: String
+
+    var body: some View {
+        if let note = model.branchNotes[path] {
+            Text(note.text)
+                .font(.system(size: 11))
+                .foregroundStyle(note.isError ? Color.orange : Theme.mutedForeground)
+                .lineLimit(2)
+                .help(note.text)
+        }
     }
 }
 
@@ -385,7 +444,7 @@ struct EnvironmentQuickRow: View {
 
     var body: some View {
         let state = model.state(of: path)
-        let busy = model.busyEnvironment != nil
+        let busy = model.busyEnvironment != nil || model.updatingBranch.contains(path)
         HStack(spacing: 8) {
             Circle().fill(state.color).frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 1) {

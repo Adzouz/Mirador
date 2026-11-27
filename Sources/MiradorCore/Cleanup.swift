@@ -86,10 +86,8 @@ public enum Cleanup {
         }
     }
 
-    static let git = "/usr/bin/git"
-
     static func run(_ args: [String], in dir: String) -> Shell.Result {
-        Shell.run(git, ["-C", dir] + args)
+        Shell.git(args, in: dir)
     }
 
     public static func isProtectedName(_ name: String) -> Bool {
@@ -138,7 +136,7 @@ public enum Cleanup {
             branches.append(branch)
         }
 
-        let list = Worktrees.list(settings: settings).filter { !$0.isMain }
+        let list = Worktrees.list(settings: settings, includingRemoved: true).filter { !$0.isMain }
         // `git status` in a monorepo checkout takes a while: check them all at once.
         var dirty = [Int](repeating: 0, count: list.count)
         dirty.withUnsafeMutableBufferPointer { buffer in
@@ -341,7 +339,7 @@ public enum Cleanup {
                                        progress: ProgressHandler? = nil) -> Outcome {
         let repo = (settings.repoPath as NSString).standardizingPath
         var outcome = Outcome()
-        let known = Worktrees.list(settings: settings)
+        let known = Worktrees.list(settings: settings, includingRemoved: true)
         let real = { (p: String) in URL(fileURLWithPath: p).resolvingSymlinksInPath().path }
         for path in paths {
             progress?(.started(path))

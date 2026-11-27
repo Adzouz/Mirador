@@ -36,6 +36,7 @@ struct EnvironmentsView: View {
                         HStack {
                             WorktreeActions(path: wt.path)
                             Spacer()
+                            if !model.isMonorepo(wt.path) { UpdateBranchButton(path: wt.path) }
                             Button { model.copy(wt.path) } label: { Image(systemName: "doc.on.doc") }
                                 .buttonStyle(ShadButtonStyle(variant: .ghost, size: .icon))
                                 .help("Copy path")
